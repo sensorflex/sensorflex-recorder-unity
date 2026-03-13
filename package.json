@@ -1,0 +1,13 @@
+{
+  "name": "com.sensorflex.recorder.unity",
+  "displayName": "SensorFlex Unity Recorder",
+  "version": "0.0.1",
+  "unity": "6000.0",
+  "license": "Apache-2.0",
+  "description": "A Unity package for capturing SensorFlex recording sessions.",
+  "author": {
+    "name": "Yiqin Zhao",
+    "email": "yzigm@rit.edu"
+  },
+  "dependencies": {}
+}

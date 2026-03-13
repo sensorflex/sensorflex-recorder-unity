@@ -1,0 +1,17 @@
+{
+  "name": "SensorFlex.Recorder.Runtime",
+  "rootNamespace": "SensorFlex.Recorder",
+  "references": [
+    "Unity.XR.ARFoundation",
+    "Unity.XR.CoreUtils"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

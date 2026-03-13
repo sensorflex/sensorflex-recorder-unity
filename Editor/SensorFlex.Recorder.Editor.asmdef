@@ -1,0 +1,14 @@
+{
+  "name": "SensorFlex.Recorder.Editor",
+  "rootNamespace": "SensorFlex.Recorder",
+  "references": [
+    "SensorFlex.Recorder.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "autoReferenced": true,
+  "noEngineReferences": false
+}
