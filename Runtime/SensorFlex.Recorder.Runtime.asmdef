@@ -3,6 +3,7 @@
   "rootNamespace": "SensorFlex.Recorder",
   "references": [
     "Unity.XR.ARFoundation",
+    "Unity.XR.ARSubsystems",
     "Unity.XR.CoreUtils"
   ],
   "includePlatforms": [],
