@@ -36,6 +36,7 @@ namespace SensorFlex.Recorder
         private CaptureFolderWriter _writer;
         private RecorderSessionManifest _manifest;
         private ARCameraManager _cameraManager;
+        private ARCameraBackground _cameraBackground;
         private AROcclusionManager _occlusionManager;
         private Camera _mainCamera;
 
@@ -98,6 +99,7 @@ namespace SensorFlex.Recorder
             if (_mainCamera != null)
             {
                 _cameraManager = _mainCamera.GetComponent<ARCameraManager>();
+                _cameraBackground = _mainCamera.GetComponent<ARCameraBackground>();
                 _occlusionManager = _mainCamera.GetComponent<AROcclusionManager>();
             }
             else
@@ -116,8 +118,21 @@ namespace SensorFlex.Recorder
 
             if (_cameraManager.subsystem == null)
             {
-                Debug.LogError("[CaptureCoordinator] XRCameraSubsystem is not active. Recording requires an active XR loader.");
+                string platformHint = Application.platform == RuntimePlatform.Android
+                    ? " On Android, enable the ARCore XR Plug-in for the Android build target and confirm the device supports ARCore."
+                    : string.Empty;
+                Debug.LogError($"[CaptureCoordinator] XRCameraSubsystem is not active. Recording requires an active XR loader.{platformHint}");
                 return false;
+            }
+
+            if (Application.platform == RuntimePlatform.Android)
+            {
+                Debug.Log($"[CaptureCoordinator] Android capture path initialized with framework '{ResolveCaptureFramework()}'.");
+            }
+
+            if (_config.CaptureColor && _cameraBackground == null)
+            {
+                Debug.LogWarning("[CaptureCoordinator] ARCameraBackground is missing on the AR camera. CPU capture may still work, but GPU fallback for rgb.jpg will be unavailable.");
             }
 
             if (_config.CaptureDepth && (_occlusionManager == null || _occlusionManager.subsystem == null))
@@ -238,11 +253,37 @@ namespace SensorFlex.Recorder
             if (_cameraManager.TryAcquireLatestCpuImage(out var image))
                 return EncodeCpuImageToJpg(image);
 
+            if (TryEncodeBackgroundTextureToJpg(out var backgroundCapture))
+                return backgroundCapture;
+
             if (args.textures != null && args.textures.Count > 0 && args.textures[0] != null)
                 return EncodeTextureToJpg(args.textures[0]);
 
-            Debug.LogWarning("[CaptureCoordinator] No camera image was available for this frame.");
+            Debug.LogWarning("[CaptureCoordinator] No camera image was available for this frame. AR Foundation color capture requires camera permission, an active ARCameraManager, and a working camera image source.");
             return default;
+        }
+
+        private bool TryEncodeBackgroundTextureToJpg(out ColorFrameCapture capture)
+        {
+            capture = default;
+
+            if (_cameraBackground == null || !_cameraBackground.enabled)
+                return false;
+
+            var backgroundMaterial = _cameraBackground.material;
+            if (backgroundMaterial == null || !backgroundMaterial.HasProperty("_MainTex"))
+                return false;
+
+            var backgroundTexture = backgroundMaterial.GetTexture("_MainTex");
+            if (backgroundTexture == null)
+                return false;
+
+            capture = EncodeTextureToJpg(
+                backgroundTexture,
+                backgroundMaterial,
+                Mathf.Max(backgroundTexture.width, _mainCamera != null ? _mainCamera.pixelWidth : Screen.width, 1),
+                Mathf.Max(backgroundTexture.height, _mainCamera != null ? _mainCamera.pixelHeight : Screen.height, 1));
+            return capture.jpgData != null && capture.jpgData.Length > 0;
         }
 
         private DepthFrameCapture TryEncodeDepthFrame()
@@ -307,13 +348,28 @@ namespace SensorFlex.Recorder
 
         private static ColorFrameCapture EncodeTextureToJpg(Texture sourceTexture)
         {
-            var renderTexture = RenderTexture.GetTemporary(sourceTexture.width, sourceTexture.height, 0, RenderTextureFormat.ARGB32);
+            return EncodeTextureToJpg(
+                sourceTexture,
+                null,
+                Mathf.Max(sourceTexture.width, 1),
+                Mathf.Max(sourceTexture.height, 1));
+        }
+
+        private static ColorFrameCapture EncodeTextureToJpg(Texture sourceTexture, Material blitMaterial, int targetWidth, int targetHeight)
+        {
+            var width = Mathf.Max(targetWidth, 1);
+            var height = Mathf.Max(targetHeight, 1);
+            var renderTexture = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
             var previousRenderTexture = RenderTexture.active;
-            var tex = new Texture2D(sourceTexture.width, sourceTexture.height, TextureFormat.RGBA32, false);
+            var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
 
             try
             {
-                Graphics.Blit(sourceTexture, renderTexture);
+                if (blitMaterial != null)
+                    Graphics.Blit(sourceTexture, renderTexture, blitMaterial);
+                else
+                    Graphics.Blit(sourceTexture, renderTexture);
+
                 RenderTexture.active = renderTexture;
                 tex.ReadPixels(new Rect(0, 0, renderTexture.width, renderTexture.height), 0, 0);
                 tex.Apply();
