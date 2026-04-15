@@ -50,6 +50,11 @@ namespace SensorFlex.Recorder
         private int _cachedMaskWidth;
         private int _cachedMaskHeight;
         private bool _captureDepthEnabled;
+        private bool _loggedMissingPose;
+        private bool _loggedMissingDepthFrame;
+        private bool _loggedDepthReadiness;
+
+        private const EnvironmentDepthMode TargetDepthMode = EnvironmentDepthMode.Medium;
 
         public string SessionFolder { get; private set; }
 
@@ -116,6 +121,12 @@ namespace SensorFlex.Recorder
                 return false;
             }
 
+            if (_config.CapturePose && _mainCamera == null)
+            {
+                Debug.LogError("[CaptureCoordinator] Camera pose capture was requested, but no AR camera reference is available.");
+                return false;
+            }
+
             if (_cameraManager.subsystem == null)
             {
                 string platformHint = Application.platform == RuntimePlatform.Android
@@ -140,6 +151,10 @@ namespace SensorFlex.Recorder
                 Debug.LogWarning("[CaptureCoordinator] Depth capture requested but XROcclusionSubsystem is unavailable. Depth will be skipped.");
                 _captureDepthEnabled = false;
             }
+            else if (_captureDepthEnabled)
+            {
+                ConfigureDepthCapture();
+            }
 
             _writer.Start();
             _cameraManager.frameReceived += OnCameraFrameReceived;
@@ -152,6 +167,9 @@ namespace SensorFlex.Recorder
             _cachedMaskPng = null;
             _cachedMaskWidth = 0;
             _cachedMaskHeight = 0;
+            _loggedMissingPose = false;
+            _loggedMissingDepthFrame = false;
+            _loggedDepthReadiness = false;
             return true;
         }
 
@@ -204,6 +222,11 @@ namespace SensorFlex.Recorder
                 var poseMatrix = BuildPoseMatrix(_mainCamera.transform.localToWorldMatrix);
                 frameMetadata.pose = poseMatrix;
                 frameMetadata.pose_raw = poseMatrix;
+            }
+            else if (_config.CapturePose && !_loggedMissingPose)
+            {
+                Debug.LogError("[CaptureCoordinator] Camera pose capture was requested, but the AR camera reference is no longer available during recording.");
+                _loggedMissingPose = true;
             }
 
             // 2. Intrinsics
@@ -292,10 +315,22 @@ namespace SensorFlex.Recorder
                 return default;
 
             if (!_occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImage))
+            {
+                if (!_loggedMissingDepthFrame)
+                {
+                    Debug.LogWarning(
+                        $"[CaptureCoordinator] Depth capture is enabled, but no smoothed environment depth CPU image is available yet. " +
+                        $"requestedMode={_occlusionManager.requestedEnvironmentDepthMode}, currentMode={_occlusionManager.currentEnvironmentDepthMode}, " +
+                        $"temporalSmoothing={_occlusionManager.environmentDepthTemporalSmoothingRequested}.");
+                    _loggedMissingDepthFrame = true;
+                }
+
                 return default;
+            }
 
             try
             {
+                _loggedMissingDepthFrame = false;
                 var plane = depthImage.GetPlane(0);
                 var bytes = new byte[plane.data.Length];
                 plane.data.CopyTo(bytes);
@@ -629,14 +664,42 @@ namespace SensorFlex.Recorder
                 {
                     width = depthFrame.width,
                     height = depthFrame.height,
-                    format = "raw_float32_le",
+                    format = "raw_uint16_le",
                     layout = "row_major",
-                    units = "meters",
-                    sensor = "lidar",
-                    range_min = 0.1,
-                    range_max = 5.0,
-                    invalid_value = 0.0
+                    units = "millimeters",
+                    sensor = "arcore_environment_depth",
+                    range_min = 0.0,
+                    range_max = 65535.0,
+                    invalid_value = 0.0,
+                    note = "Smoothed environment depth acquired through AROcclusionManager.TryAcquireEnvironmentDepthCpuImage(). Each pixel is an unsigned 16-bit little-endian distance in millimeters along the camera principal axis."
                 };
+            }
+        }
+
+        private void ConfigureDepthCapture()
+        {
+            if (_occlusionManager == null)
+                return;
+
+            if (_occlusionManager.requestedEnvironmentDepthMode == EnvironmentDepthMode.Disabled)
+            {
+                Debug.LogWarning("[CaptureCoordinator] Depth capture requested while AROcclusionManager environment depth mode is disabled in the scene. Promoting it to Medium for this recording.");
+                _occlusionManager.requestedEnvironmentDepthMode = TargetDepthMode;
+            }
+            else if (_occlusionManager.requestedEnvironmentDepthMode == EnvironmentDepthMode.Fastest)
+            {
+                Debug.LogWarning("[CaptureCoordinator] Depth capture requested with Fastest mode, which bypasses smoothing. Promoting it to Medium for smoothed environment depth recording.");
+                _occlusionManager.requestedEnvironmentDepthMode = TargetDepthMode;
+            }
+
+            _occlusionManager.environmentDepthTemporalSmoothingRequested = true;
+
+            if (!_loggedDepthReadiness)
+            {
+                Debug.Log(
+                    $"[CaptureCoordinator] Depth capture configured with requestedMode={_occlusionManager.requestedEnvironmentDepthMode}, " +
+                    $"currentMode={_occlusionManager.currentEnvironmentDepthMode}, temporalSmoothing={_occlusionManager.environmentDepthTemporalSmoothingRequested}.");
+                _loggedDepthReadiness = true;
             }
         }
 

@@ -56,7 +56,9 @@ namespace SensorFlex.Recorder
                 AppendProperty(sb, "sensor", manifest.depth.sensor, 2, true);
                 AppendProperty(sb, "range_min", manifest.depth.range_min, 2, true);
                 AppendProperty(sb, "range_max", manifest.depth.range_max, 2, true);
-                AppendProperty(sb, "invalid_value", manifest.depth.invalid_value, 2, false);
+                AppendProperty(sb, "invalid_value", manifest.depth.invalid_value, 2, manifest.depth.note != null);
+                if (manifest.depth.note != null)
+                    AppendProperty(sb, "note", manifest.depth.note, 2, false);
                 sb.AppendLine(Indent(1) + "},");
             }
 

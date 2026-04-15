@@ -88,6 +88,7 @@ namespace SensorFlex.Recorder
         public double range_min;
         public double range_max;
         public double invalid_value;
+        public string note;
     }
 
     [Serializable]
