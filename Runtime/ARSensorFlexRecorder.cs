@@ -1,17 +1,20 @@
 using Unity.XR.CoreUtils;
 using UnityEngine;
+using System.IO;
+using UnityEngine.XR.ARFoundation;
+using System;
 
 namespace SensorFlex.Recorder
 {
-    /// <summary>
-    /// Primary public integration component for SensorFlex recording sessions.
-    /// Attach this to an <see cref="XROrigin"/> to host future capture workflows.
-    /// </summary>
     [DisallowMultipleComponent]
     [RequireComponent(typeof(XROrigin))]
     [AddComponentMenu("XR/SensorFlex/AR SensorFlex Recorder")]
     public sealed class ARSensorFlexRecorder : MonoBehaviour
     {
+        public event Action<string> RecordingStartedEvent;
+        public event Action<string> RecordingFinalizedEvent;
+        public event Action<string> RecordingFailedEvent;
+
         [Header("Capture")]
         [Min(1)]
         [SerializeField] int m_TargetFPS = 30;
@@ -44,11 +47,50 @@ namespace SensorFlex.Recorder
         public bool CaptureSceneMesh => m_CaptureSceneMesh;
         public string OutputDirectory => m_OutputDirectory;
         public bool IsRecording { get; private set; }
+        public string ActiveSessionFolder { get; private set; }
+        public string LastArchivePath { get; private set; }
+        public string LastError { get; private set; }
+
+        private CaptureCoordinator _coordinator;
+        private bool _recordOnStartPending;
+        private float _recordOnStartDeadline;
 
         void Start()
         {
             if (m_RecordOnStart)
-                StartRecording();
+            {
+                _recordOnStartPending = true;
+                _recordOnStartDeadline = Time.realtimeSinceStartup + 5f;
+            }
+        }
+
+        void Update()
+        {
+            if (_recordOnStartPending && !IsRecording)
+            {
+                var origin = GetComponent<XROrigin>();
+                var camera = origin != null ? origin.Camera : Camera.main;
+                var cameraManager = camera != null ? camera.GetComponent<ARCameraManager>() : null;
+
+                if (cameraManager != null && cameraManager.subsystem != null && cameraManager.subsystem.running)
+                {
+                    _recordOnStartPending = false;
+                    StartRecording();
+                }
+                else if (Time.realtimeSinceStartup >= _recordOnStartDeadline)
+                {
+                    _recordOnStartPending = false;
+                    Debug.LogWarning("[SF-Recorder] RecordOnStart timed out waiting for an active camera subsystem.");
+                }
+            }
+        }
+
+        void OnDestroy()
+        {
+            if (IsRecording)
+            {
+                StopRecording();
+            }
         }
 
         public void StartRecording()
@@ -56,8 +98,31 @@ namespace SensorFlex.Recorder
             if (IsRecording)
                 return;
 
+            LastError = null;
+            LastArchivePath = null;
+            ActiveSessionFolder = null;
+
+            string rootPath = Path.IsPathRooted(m_OutputDirectory) 
+                ? m_OutputDirectory 
+                : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
+
+            if (!Directory.Exists(rootPath))
+                Directory.CreateDirectory(rootPath);
+
+            _coordinator = new CaptureCoordinator(this, rootPath);
+            if (!_coordinator.StartCapture())
+            {
+                LastError = "Recorder failed to start because XR capture was not ready.";
+                _coordinator.Dispose();
+                _coordinator = null;
+                RecordingFailedEvent?.Invoke(LastError);
+                return;
+            }
+
             IsRecording = true;
-            Debug.Log($"[SF-Recorder] Recording started. Output='{m_OutputDirectory}' FPS={TargetFPS}");
+            ActiveSessionFolder = _coordinator.SessionFolder;
+            Debug.Log($"[SF-Recorder] Recording started. Output='{_coordinator.SessionFolder}' FPS={TargetFPS}");
+            RecordingStartedEvent?.Invoke(_coordinator.SessionFolder);
         }
 
         public void StopRecording()
@@ -66,7 +131,21 @@ namespace SensorFlex.Recorder
                 return;
 
             IsRecording = false;
-            Debug.Log("[SF-Recorder] Recording stopped.");
+            
+            if (_coordinator != null)
+            {
+                string sessionFolder = _coordinator.SessionFolder;
+                _coordinator.StopCapture();
+                _coordinator.Dispose();
+                _coordinator = null;
+
+                Debug.Log($"[SF-Recorder] Recording stopped. Finalizing archive...");
+                string archivePath = sessionFolder + ".zip";
+                ArchiveFinalizer.FinalizeArchive(sessionFolder, archivePath);
+                LastArchivePath = archivePath;
+                ActiveSessionFolder = null;
+                RecordingFinalizedEvent?.Invoke(archivePath);
+            }
         }
     }
 }
