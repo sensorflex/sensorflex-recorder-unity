@@ -1,312 +1,230 @@
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 
 namespace SensorFlex.Recorder
 {
-    internal static class RecorderJsonSerializer
+    // Builds session.json for the SFZ 1.0 format.
+    // Single-file: pass parts = null → no "parts" key is emitted.
+    // Multi-part:  pass the partition plan → "parts" array is written into part 0's JSON.
+    internal static class SfzSerializer
     {
-        public static string SerializeSessionManifest(RecorderSessionManifest manifest)
+        public static byte[] BuildSessionJson(
+            SfzSessionMetadata meta,
+            List<SfzFrameRecord> frames,
+            SfzPartPlan[] parts)
         {
-            var sb = new StringBuilder(4096);
-            sb.AppendLine("{");
-            AppendProperty(sb, "format_version", manifest.format_version, 1, true);
+            var sb = new StringBuilder(512 + frames.Count * 160);
+            sb.Append("{\n");
 
-            sb.AppendLine(Indent(1) + "\"source\": {");
-            AppendProperty(sb, "dataset", manifest.source?.dataset, 2, true);
-            AppendProperty(sb, "device", manifest.source?.device, 2, true);
-            AppendProperty(sb, "capture_framework", manifest.source?.capture_framework, 2, false);
-            sb.AppendLine(Indent(1) + "},");
+            // ── Top-level scalars ────────────────────────────────────────────
+            AppendStr(sb, "version",        "1.0",                1, true);
+            AppendStr(sb, "session_id",     meta.SessionId,       1, true);
+            AppendStr(sb, "start_time_utc", meta.StartTimeUtc,    1, true);
 
-            sb.AppendLine(Indent(1) + "\"coordinate_system\": {");
-            AppendProperty(sb, "handedness", manifest.coordinate_system?.handedness, 2, true);
-            AppendProperty(sb, "up", manifest.coordinate_system?.up, 2, true);
-            AppendProperty(sb, "forward", manifest.coordinate_system?.forward, 2, true);
-            AppendProperty(sb, "units", manifest.coordinate_system?.units, 2, false);
-            sb.AppendLine(Indent(1) + "},");
+            // ── device ───────────────────────────────────────────────────────
+            sb.Append(I(1)).Append("\"device\": {\n");
+            AppendStr(sb, "model",        meta.DeviceModel,   2, true);
+            AppendStr(sb, "os",           meta.DeviceOs,      2, true);
+            AppendStr(sb, "ar_framework", meta.ArFramework,   2, false);
+            sb.Append(I(1)).Append("},\n");
 
-            AppendPoseSchema(sb, "pose", manifest.pose, true);
-            AppendPoseSchema(sb, "pose_raw", manifest.pose_raw, true);
-
-            sb.AppendLine(Indent(1) + "\"camera\": {");
-            AppendProperty(sb, "model", manifest.camera?.model, 2, true);
-            AppendProperty(sb, "distortion_model", manifest.camera?.distortion_model, 2, true);
-            AppendDoubleArrayProperty(sb, "distortion_coefficients", manifest.camera?.distortion_coefficients, 2, true);
-            AppendProperty(sb, "intrinsic_variation", manifest.camera?.intrinsic_variation, 2, true);
-            AppendProperty(sb, "intrinsic_layout", manifest.camera?.intrinsic_layout, 2, false);
-            sb.AppendLine(Indent(1) + "},");
-
-            if (manifest.rgb != null)
+            // ── parts (multi-part only) ──────────────────────────────────────
+            if (parts != null && parts.Length > 0)
             {
-                sb.AppendLine(Indent(1) + "\"rgb\": {");
-                AppendProperty(sb, "width", manifest.rgb.width, 2, true);
-                AppendProperty(sb, "height", manifest.rgb.height, 2, true);
-                AppendProperty(sb, "format", manifest.rgb.format, 2, true);
-                AppendProperty(sb, "anonymization", manifest.rgb.anonymization, 2, false);
-                sb.AppendLine(Indent(1) + "},");
-            }
-
-            if (manifest.depth != null)
-            {
-                sb.AppendLine(Indent(1) + "\"depth\": {");
-                AppendProperty(sb, "width", manifest.depth.width, 2, true);
-                AppendProperty(sb, "height", manifest.depth.height, 2, true);
-                AppendProperty(sb, "format", manifest.depth.format, 2, true);
-                AppendProperty(sb, "layout", manifest.depth.layout, 2, true);
-                AppendProperty(sb, "units", manifest.depth.units, 2, true);
-                AppendProperty(sb, "sensor", manifest.depth.sensor, 2, true);
-                AppendProperty(sb, "range_min", manifest.depth.range_min, 2, true);
-                AppendProperty(sb, "range_max", manifest.depth.range_max, 2, true);
-                AppendProperty(sb, "invalid_value", manifest.depth.invalid_value, 2, manifest.depth.note != null);
-                if (manifest.depth.note != null)
-                    AppendProperty(sb, "note", manifest.depth.note, 2, false);
-                sb.AppendLine(Indent(1) + "},");
-            }
-
-            if (manifest.mask != null)
-            {
-                sb.AppendLine(Indent(1) + "\"mask\": {");
-                AppendProperty(sb, "width", manifest.mask.width, 2, true);
-                AppendProperty(sb, "height", manifest.mask.height, 2, true);
-                AppendProperty(sb, "format", manifest.mask.format, 2, true);
-                AppendProperty(sb, "description", manifest.mask.description, 2, false);
-                sb.AppendLine(Indent(1) + "},");
-            }
-
-            if (manifest.imu != null)
-            {
-                sb.AppendLine(Indent(1) + "\"imu\": {");
-                AppendProperty(sb, "frame", manifest.imu.frame, 2, true);
-                sb.AppendLine(Indent(2) + "\"fields\": {");
-                AppendVectorField(sb, "rotate_rate", manifest.imu.fields?.rotate_rate, true);
-                AppendVectorField(sb, "acceleration", manifest.imu.fields?.acceleration, true);
-                AppendVectorField(sb, "magnet", manifest.imu.fields?.magnet, true);
-                AppendVectorField(sb, "attitude", manifest.imu.fields?.attitude, true);
-                AppendVectorField(sb, "gravity", manifest.imu.fields?.gravity, false);
-                sb.AppendLine(Indent(2) + "}");
-                sb.AppendLine(Indent(1) + "},");
-            }
-
-            AppendProperty(sb, "fps", manifest.fps, 1, true);
-            AppendProperty(sb, "scene_id", manifest.scene_id, 1, true);
-            AppendProperty(sb, "n_frames", manifest.n_frames, 1, manifest.scanned_mesh != null);
-
-            if (manifest.scanned_mesh != null)
-            {
-                sb.AppendLine(Indent(1) + "\"scanned_mesh\": {");
-                AppendProperty(sb, "path", manifest.scanned_mesh.path, 2, true);
-                AppendProperty(sb, "format", manifest.scanned_mesh.format, 2, true);
-                AppendProperty(sb, "units", manifest.scanned_mesh.units, 2, true);
-                AppendProperty(sb, "coordinate_frame", manifest.scanned_mesh.coordinate_frame, 2, true);
-                AppendProperty(sb, "note", manifest.scanned_mesh.note, 2, false);
-                sb.AppendLine(Indent(1) + "}");
-            }
-
-            sb.AppendLine("}");
-            return sb.ToString();
-        }
-
-        public static string SerializeFrameMetadata(FrameMetadata metadata)
-        {
-            var sb = new StringBuilder(2048);
-            sb.AppendLine("{");
-            AppendProperty(sb, "timestamp", metadata.timestamp, 1, true);
-            AppendMatrixProperty(sb, "pose", metadata.pose, 1, true);
-            AppendMatrixProperty(sb, "pose_raw", metadata.pose_raw, 1, true);
-            AppendMatrixProperty(sb, "intrinsic", metadata.intrinsic, 1, true);
-            sb.AppendLine(Indent(1) + "\"imu\": {");
-            AppendDoubleArrayProperty(sb, "rotate_rate", metadata.imu?.rotate_rate, 2, true);
-            AppendDoubleArrayProperty(sb, "acceleration", metadata.imu?.acceleration, 2, true);
-            AppendDoubleArrayProperty(sb, "magnet", metadata.imu?.magnet, 2, true);
-            AppendDoubleArrayProperty(sb, "attitude", metadata.imu?.attitude, 2, true);
-            AppendDoubleArrayProperty(sb, "gravity", metadata.imu?.gravity, 2, false);
-            sb.AppendLine(Indent(1) + "}");
-            sb.AppendLine("}");
-            return sb.ToString();
-        }
-
-        private static void AppendPoseSchema(StringBuilder sb, string propertyName, PoseSchemaMetadata metadata, bool trailingComma)
-        {
-            sb.AppendLine(Indent(1) + $"\"{propertyName}\": {{");
-            AppendProperty(sb, "convention", metadata?.convention, 2, true);
-            AppendProperty(sb, "scale", metadata?.scale, 2, true);
-            AppendProperty(sb, "layout", metadata?.layout, 2, metadata != null && !string.IsNullOrEmpty(metadata.note));
-            if (metadata != null && !string.IsNullOrEmpty(metadata.note))
-                AppendProperty(sb, "note", metadata.note, 2, false);
-            sb.AppendLine(Indent(1) + "}" + (trailingComma ? "," : ""));
-        }
-
-        private static void AppendVectorField(StringBuilder sb, string propertyName, VectorFieldMetadata metadata, bool trailingComma)
-        {
-            sb.AppendLine(Indent(3) + $"\"{propertyName}\": {{");
-            AppendProperty(sb, "units", metadata?.units, 4, true);
-            AppendIntArrayProperty(sb, "shape", metadata?.shape, 4, true);
-            AppendStringArrayProperty(sb, "axes", metadata?.axes, 4, metadata != null && !string.IsNullOrEmpty(metadata.note));
-            if (metadata != null && !string.IsNullOrEmpty(metadata.note))
-                AppendProperty(sb, "note", metadata.note, 4, false);
-            sb.AppendLine(Indent(3) + "}" + (trailingComma ? "," : ""));
-        }
-
-        private static void AppendProperty(StringBuilder sb, string name, string value, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ");
-            AppendQuoted(sb, value ?? string.Empty);
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
-
-        private static void AppendProperty(StringBuilder sb, string name, int value, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ").Append(value);
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
-
-        private static void AppendProperty(StringBuilder sb, string name, double value, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ").Append(FormatNumber(value));
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
-
-        private static void AppendDoubleArrayProperty(StringBuilder sb, string name, double[] values, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ");
-            AppendDoubleArray(sb, values);
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
-
-        private static void AppendIntArrayProperty(StringBuilder sb, string name, int[] values, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ");
-            sb.Append('[');
-            if (values != null)
-            {
-                for (var i = 0; i < values.Length; i++)
+                sb.Append(I(1)).Append("\"parts\": [\n");
+                for (int p = 0; p < parts.Length; p++)
                 {
-                    if (i > 0)
-                        sb.Append(", ");
-                    sb.Append(values[i]);
-                }
-            }
-            sb.Append(']');
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
+                    var part = parts[p];
+                    sb.Append(I(2)).Append("{\n");
+                    AppendStr(sb, "file", part.FileName, 3, true);
+                    sb.Append(I(3)).Append("\"contents\": [\n");
 
-        private static void AppendStringArrayProperty(StringBuilder sb, string name, string[] values, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ");
-            sb.Append('[');
-            if (values != null)
-            {
-                for (var i = 0; i < values.Length; i++)
-                {
-                    if (i > 0)
-                        sb.Append(", ");
-                    AppendQuoted(sb, values[i] ?? string.Empty);
-                }
-            }
-            sb.Append(']');
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
+                    bool isFirstPart = p == 0;
+                    bool isLastContent = part.FrameEnd <= part.FrameStart;
 
-        private static void AppendMatrixProperty(StringBuilder sb, string name, double[][] matrix, int indentLevel, bool trailingComma)
-        {
-            sb.Append(Indent(indentLevel)).Append('"').Append(name).Append("\": ");
-            AppendMatrix(sb, matrix);
-            if (trailingComma)
-                sb.Append(',');
-            sb.AppendLine();
-        }
-
-        private static void AppendMatrix(StringBuilder sb, double[][] matrix)
-        {
-            sb.Append("[\n");
-            if (matrix != null)
-            {
-                for (var row = 0; row < matrix.Length; row++)
-                {
-                    sb.Append(Indent(2)).Append('[');
-                    var values = matrix[row];
-                    if (values != null)
+                    if (isFirstPart)
                     {
-                        for (var col = 0; col < values.Length; col++)
-                        {
-                            if (col > 0)
-                                sb.Append(", ");
-                            sb.Append(FormatNumber(values[col]));
-                        }
+                        // Part 0 holds session.json
+                        sb.Append(I(4)).Append("{ \"type\": \"session\" }");
+                        if (part.FrameEnd > part.FrameStart) sb.Append(',');
+                        sb.Append('\n');
                     }
-                    sb.Append(']');
-                    if (row < matrix.Length - 1)
-                        sb.Append(',');
+
+                    if (part.FrameEnd > part.FrameStart)
+                    {
+                        sb.Append(I(4))
+                          .Append("{ \"type\": \"frames\", \"frame_range\": [")
+                          .Append(part.FrameStart)
+                          .Append(", ")
+                          .Append(part.FrameEnd)
+                          .Append("] }\n");
+                    }
+
+                    sb.Append(I(3)).Append("]\n");
+                    sb.Append(I(2)).Append('}');
+                    if (p < parts.Length - 1) sb.Append(',');
                     sb.Append('\n');
                 }
+                sb.Append(I(1)).Append("],\n");
             }
-            sb.Append(Indent(1)).Append(']');
+
+            // ── tracks ───────────────────────────────────────────────────────
+            sb.Append(I(1)).Append("\"tracks\": {\n");
+            sb.Append(I(2)).Append("\"frames\": {\n");
+
+            // metadata
+            sb.Append(I(3)).Append("\"metadata\": {\n");
+            AppendInt(sb, "fps", meta.Fps, 4, true);
+            sb.Append(I(4)).Append("\"channels\": {\n");
+
+            bool rgbTrailing = meta.HasDepth;
+            if (meta.HasRgb)
+            {
+                sb.Append(I(5)).Append("\"rgb\": {\n");
+                AppendInt(sb, "width",  meta.RgbWidth,  6, true);
+                AppendInt(sb, "height", meta.RgbHeight, 6, true);
+                AppendStr(sb, "format", "jpeg",         6, false);
+                sb.Append(I(5)).Append('}');
+                if (rgbTrailing) sb.Append(',');
+                sb.Append('\n');
+            }
+
+            if (meta.HasDepth)
+            {
+                sb.Append(I(5)).Append("\"depth\": {\n");
+                AppendInt(sb, "width",  meta.DepthWidth,  6, true);
+                AppendInt(sb, "height", meta.DepthHeight, 6, true);
+                AppendStr(sb, "format", "raw_float32_le", 6, true);
+                AppendStr(sb, "units",  "meters",         6, true);
+                AppendStr(sb, "sensor", meta.DepthSensor ?? "arcore_environment_depth", 6, true);
+                AppendDbl(sb, "invalid_value", 0.0,       6, false);
+                sb.Append(I(5)).Append("}\n");
+            }
+
+            sb.Append(I(4)).Append("}\n");   // channels
+            sb.Append(I(3)).Append("},\n");  // metadata
+
+            // data array
+            sb.Append(I(3)).Append("\"data\": [\n");
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                AppendFrameRecord(sb, f, 4);
+                if (i < frames.Count - 1) sb.Append(',');
+                sb.Append('\n');
+            }
+            sb.Append(I(3)).Append("]\n");   // data
+
+            sb.Append(I(2)).Append("}\n");   // frames
+            sb.Append(I(1)).Append("}\n");   // tracks
+            sb.Append("}\n");                // root
+
+            return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
-        private static void AppendDoubleArray(StringBuilder sb, double[] values)
+        // ── Frame record ─────────────────────────────────────────────────────
+
+        static void AppendFrameRecord(StringBuilder sb, SfzFrameRecord f, int indent)
         {
-            sb.Append('[');
-            if (values != null)
+            sb.Append(I(indent)).Append('{');
+            sb.Append("\"timestamp_ns\":").Append(f.TimestampNs).Append(',');
+
+            // camera
+            sb.Append("\"camera\":{");
+            sb.Append("\"pose\":{");
+            sb.Append("\"position\":[");
+            sb.Append(F(f.Position.x)).Append(',')
+              .Append(F(f.Position.y)).Append(',')
+              .Append(F(f.Position.z));
+            sb.Append("],\"rotation\":[");
+            sb.Append(F(f.Rotation.x)).Append(',')
+              .Append(F(f.Rotation.y)).Append(',')
+              .Append(F(f.Rotation.z)).Append(',')
+              .Append(F(f.Rotation.w));
+            sb.Append("]}");
+
+            if (f.HasIntrinsics)
             {
-                for (var i = 0; i < values.Length; i++)
+                sb.Append(",\"intrinsics\":{");
+                sb.Append("\"fx\":").Append(F(f.Fx)).Append(',');
+                sb.Append("\"fy\":").Append(F(f.Fy)).Append(',');
+                sb.Append("\"cx\":").Append(F(f.Cx)).Append(',');
+                sb.Append("\"cy\":").Append(F(f.Cy));
+                sb.Append('}');
+            }
+
+            sb.Append('}');  // camera
+
+            if (f.HasColor)
+            {
+                string file = "rgb/" + f.FrameIndex.ToString("D6") + ".jpg";
+                sb.Append(",\"rgb\":{\"file\":").Append('"').Append(file).Append("\"}");
+            }
+
+            if (f.HasDepth)
+            {
+                string file = "depth/" + f.FrameIndex.ToString("D6") + ".bin";
+                sb.Append(",\"depth\":{\"file\":").Append('"').Append(file).Append("\"}");
+            }
+
+            sb.Append('}');
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────────────
+
+        static void AppendStr(StringBuilder sb, string key, string value, int indent, bool comma)
+        {
+            sb.Append(I(indent)).Append('"').Append(key).Append("\": \"");
+            AppendEscaped(sb, value ?? string.Empty);
+            sb.Append('"');
+            if (comma) sb.Append(',');
+            sb.Append('\n');
+        }
+
+        static void AppendInt(StringBuilder sb, string key, int value, int indent, bool comma)
+        {
+            sb.Append(I(indent)).Append('"').Append(key).Append("\": ").Append(value);
+            if (comma) sb.Append(',');
+            sb.Append('\n');
+        }
+
+        static void AppendDbl(StringBuilder sb, string key, double value, int indent, bool comma)
+        {
+            sb.Append(I(indent)).Append('"').Append(key).Append("\": ")
+              .Append(value.ToString("0.################", CultureInfo.InvariantCulture));
+            if (comma) sb.Append(',');
+            sb.Append('\n');
+        }
+
+        static void AppendEscaped(StringBuilder sb, string s)
+        {
+            foreach (char c in s)
+            {
+                switch (c)
                 {
-                    if (i > 0)
-                        sb.Append(", ");
-                    sb.Append(FormatNumber(values[i]));
+                    case '"':  sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n");  break;
+                    case '\r': sb.Append("\\r");  break;
+                    case '\t': sb.Append("\\t");  break;
+                    default:   sb.Append(c);      break;
                 }
             }
-            sb.Append(']');
         }
 
-        private static void AppendQuoted(StringBuilder sb, string value)
-        {
-            sb.Append('"');
-            foreach (var ch in value)
-            {
-                switch (ch)
-                {
-                    case '\\':
-                        sb.Append("\\\\");
-                        break;
-                    case '"':
-                        sb.Append("\\\"");
-                        break;
-                    case '\n':
-                        sb.Append("\\n");
-                        break;
-                    case '\r':
-                        sb.Append("\\r");
-                        break;
-                    case '\t':
-                        sb.Append("\\t");
-                        break;
-                    default:
-                        sb.Append(ch);
-                        break;
-                }
-            }
-            sb.Append('"');
-        }
+        // 9 significant digits preserves float32 values exactly on round-trip.
+        static string F(float v) => v.ToString("G9", CultureInfo.InvariantCulture);
 
-        private static string Indent(int level)
+        static string I(int level) => level switch
         {
-            return new string(' ', level * 2);
-        }
-
-        private static string FormatNumber(double value)
-        {
-            return value.ToString("0.################", CultureInfo.InvariantCulture);
-        }
+            1 => "  ",
+            2 => "    ",
+            3 => "      ",
+            4 => "        ",
+            5 => "          ",
+            6 => "            ",
+            _ => new string(' ', level * 2)
+        };
     }
 }

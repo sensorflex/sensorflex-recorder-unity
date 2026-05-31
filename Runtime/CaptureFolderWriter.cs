@@ -1,141 +1,105 @@
+using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Threading;
-using System.Collections.Concurrent;
 using UnityEngine;
 
 namespace SensorFlex.Recorder
 {
-    public class CaptureFolderWriter
+    // Writes rgb/NNNNNN.jpg and depth/NNNNNN.bin to disk on a background thread.
+    // All frame metadata lives in-memory in CaptureCoordinator; this class only
+    // handles binary file persistence.
+    internal sealed class CaptureFolderWriter
     {
         public struct FrameWriteJob
         {
-            public int frameIndex;
-            public byte[] jpgData;
-            public byte[] maskPngData;
-            public byte[] depthData;
-            public string metaJson;
+            public int    FrameIndex;
+            public byte[] JpgData;       // null when color not captured
+            public byte[] DepthF32Data;  // raw_float32_le meters; null when depth not captured
         }
 
-        private string _sessionFolder;
-        private string _framesFolder;
+        readonly string _rgbDir;
+        readonly string _depthDir;
+        readonly BlockingCollection<FrameWriteJob> _queue;
 
-        private Thread _workerThread;
-        private BlockingCollection<FrameWriteJob> _writeQueue;
-        private bool _isRunning;
+        Thread _workerThread;
+        bool   _isRunning;
 
-        // Bounded queue to avoid unbounded memory growth
-        private const int MAX_QUEUE_SIZE = 120;
+        // Frames further ahead than this from the playhead are held back to avoid
+        // unbounded memory growth on the producer side.
+        const int MaxQueueSize = 120;
 
-        public CaptureFolderWriter(string sessionFolder)
+        public CaptureFolderWriter(string sessionTempDir)
         {
-            _sessionFolder = sessionFolder;
-            _framesFolder = Path.Combine(_sessionFolder, "frames");
+            _rgbDir   = Path.Combine(sessionTempDir, "rgb");
+            _depthDir = Path.Combine(sessionTempDir, "depth");
 
-            if (!Directory.Exists(_sessionFolder))
-                Directory.CreateDirectory(_sessionFolder);
+            Directory.CreateDirectory(sessionTempDir);
+            Directory.CreateDirectory(_rgbDir);
+            Directory.CreateDirectory(_depthDir);
 
-            if (!Directory.Exists(_framesFolder))
-                Directory.CreateDirectory(_framesFolder);
-
-            _writeQueue = new BlockingCollection<FrameWriteJob>(MAX_QUEUE_SIZE);
+            _queue = new BlockingCollection<FrameWriteJob>(MaxQueueSize);
         }
 
         public void Start()
         {
-            _isRunning = true;
-            _workerThread = new Thread(WriteLoop);
-            _workerThread.IsBackground = true;
-            _workerThread.Name = "CaptureFolderWriterThread";
+            _isRunning    = true;
+            _workerThread = new Thread(WriteLoop)
+            {
+                IsBackground = true,
+                Name         = "SF-Recorder-DiskWriter"
+            };
             _workerThread.Start();
         }
 
+        // Returns false when the queue is full — the caller should drop the frame
+        // rather than blocking the main thread.
+        public bool TryEnqueue(FrameWriteJob job)
+        {
+            if (!_isRunning || _queue.IsAddingCompleted)
+                return false;
+            return _queue.TryAdd(job);
+        }
+
+        // Stop accepting new jobs and wait for the background thread to flush all
+        // pending writes before returning.
         public void Stop()
         {
             _isRunning = false;
-            // Signal queue completion
-            _writeQueue.CompleteAdding();
-            
-            if (_workerThread != null && _workerThread.IsAlive)
-            {
-                // Wait for the background thread to flush pending writes
-                _workerThread.Join(5000); 
-            }
-            
-            _writeQueue.Dispose();
+            _queue.CompleteAdding();
+            _workerThread?.Join(10_000);
+            _queue.Dispose();
         }
 
-        public void WriteSessionManifest(RecorderSessionManifest manifest)
-        {
-            try 
-            {
-                string json = RecorderJsonSerializer.SerializeSessionManifest(manifest);
-                string path = Path.Combine(_sessionFolder, "meta.json");
-                File.WriteAllText(path, json);
-            } 
-            catch (System.Exception e)
-            {
-                Debug.LogError($"[CaptureFolderWriter] Failed to write session manifest: {e.Message}");
-            }
-        }
-
-        public bool TryEnqueueFrame(FrameWriteJob job)
-        {
-            if (!_isRunning || _writeQueue.IsAddingCompleted)
-                return false;
-
-            // Bounded queue explicit backpressure policy - if full, drop/ignore current frame or wait.
-            // Using TryAdd to immediately drop if queue is full (do not block main thread).
-            return _writeQueue.TryAdd(job);
-        }
-
-        private void WriteLoop()
+        void WriteLoop()
         {
             while (true)
             {
                 FrameWriteJob job;
-                
                 try
                 {
-                    if (!_writeQueue.TryTake(out job, Timeout.Infinite))
-                    {
-                        // TryTake failed and CompleteAdding was called
+                    if (!_queue.TryTake(out job, Timeout.Infinite))
                         break;
-                    }
                 }
-                catch (System.InvalidOperationException) // Queue closed
+                catch (InvalidOperationException)
                 {
+                    // Queue was completed and is now empty.
                     break;
                 }
 
-                // Write actual data
-                string frameDir = Path.Combine(_framesFolder, job.frameIndex.ToString("D6"));
-                if (!Directory.Exists(frameDir))
-                {
-                    Directory.CreateDirectory(frameDir);
-                }
+                string stem = job.FrameIndex.ToString("D6");
 
-                if (job.jpgData != null && job.jpgData.Length > 0)
+                try
                 {
-                    string colorPath = Path.Combine(frameDir, "rgb.jpg");
-                    File.WriteAllBytes(colorPath, job.jpgData);
-                }
+                    if (job.JpgData != null && job.JpgData.Length > 0)
+                        File.WriteAllBytes(Path.Combine(_rgbDir, stem + ".jpg"), job.JpgData);
 
-                if (job.maskPngData != null && job.maskPngData.Length > 0)
-                {
-                    string maskPath = Path.Combine(frameDir, "mask.png");
-                    File.WriteAllBytes(maskPath, job.maskPngData);
+                    if (job.DepthF32Data != null && job.DepthF32Data.Length > 0)
+                        File.WriteAllBytes(Path.Combine(_depthDir, stem + ".bin"), job.DepthF32Data);
                 }
-
-                if (job.depthData != null && job.depthData.Length > 0)
+                catch (Exception e)
                 {
-                    string depthPath = Path.Combine(frameDir, "depth.bin");
-                    File.WriteAllBytes(depthPath, job.depthData);
-                }
-
-                if (!string.IsNullOrEmpty(job.metaJson))
-                {
-                    string metaPath = Path.Combine(frameDir, "meta.json");
-                    File.WriteAllText(metaPath, job.metaJson);
+                    Debug.LogError($"[SF-Recorder] Disk write failed for frame {job.FrameIndex}: {e.Message}");
                 }
             }
         }

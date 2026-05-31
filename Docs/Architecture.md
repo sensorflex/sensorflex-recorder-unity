@@ -2,311 +2,427 @@
 
 `com.sensorflex.recorder.unity` is the recording-side counterpart to `com.sensorflex.player.unity`.
 
-The recorder should be designed as a classical real-time capture pipeline:
+The recorder captures ARFoundation session data in real time, persists binary frame assets to a
+temporary folder on device during recording, and packages the result into one or more SFZ 1.0
+archives after recording stops.
 
-- acquire ARFoundation data on the main thread
-- stage only the minimum required data in memory
-- persist raw capture artifacts to a folder on device during recording
-- package that folder into the player-compatible `.zip` archive after recording stops
-
-This keeps the live path simple and high-performance while still producing the same archive structure consumed by the player.
-
-Configuration should follow the same approach used by the player package:
-
-- recorder options live on scene components and are edited through the Inspector
-- the recorder should not rely on a package-level `ScriptableObject` settings asset
-- scene-local configuration is the source of truth for recording behavior
+The output format is exactly the SFZ 1.0 specification consumed by the player. No conversion step
+is required to replay a recorded archive.
 
 ## Goals
 
 - Record ARFoundation data in real time without stalling frame delivery.
-- Preserve enough metadata to reconstruct the same playback format used by the player.
-- Prefer folder-first capture for reliability and crash recovery.
-- Treat zip creation as a finalization/export step, not a live recording step.
-- Keep scene-facing APIs small and understandable.
+- Produce SFZ 1.0 archives that the player can replay directly.
+- Keep the live capture path as simple as possible: write binary files, accumulate lightweight metadata.
+- Treat archive creation as a post-recording finalization step.
+- Keep scene-facing APIs small.
 
 ## Non-Goals
 
-- Writing compressed zip entries directly in the hot capture path.
-- Building a generalized media pipeline for unrelated formats.
+- Compressing or zipping entries in the hot capture path.
+- Per-frame JSON files on disk.
+- Generalized media pipelines for unrelated formats.
 - Capturing every ARFoundation subsystem on day one.
+
+## System Overview
+
+```
+ ┌─────────────────────────────────────────────────────────┐
+ │  Scene                                                   │
+ │                                                          │
+ │  XROrigin ──── ARSensorFlexRecorder                      │
+ │    └─ Camera                                             │
+ │         ├─ ARCameraManager                               │
+ │         └─ AROcclusionManager                            │
+ └───────────────┬─────────────────────┬───────────────────┘
+                 │ frameReceived        │ depth CPU image
+                 │                      │
+ ┌───────────────▼──────────────────────▼───────────────────┐
+ │  MAIN THREAD                                              │
+ │                                                           │
+ │  CaptureCoordinator.OnCameraFrameReceived()               │
+ │                                                           │
+ │   color  ──► encode JPEG  (XRCpuImage › Texture2D › JPG) │
+ │   depth  ──► float32 m    (uint16 mm ÷ 1000, or copy)    │
+ │   pose   ──► position + quaternion  (Camera.transform)    │
+ │   intrin ──► native › FOV estimate › cached fallback      │
+ │                                          │                │
+ │   SfzFrameRecord ────────────────────────┼──► List<>      │
+ │   (per-frame metadata, ~64 bytes)        │    in memory   │
+ │                                          │                │
+ │   FrameWriteJob (jpg bytes, depth bytes) │                │
+ │     │                                    │                │
+ └─────┼────────────────────────────────────┼────────────────┘
+       │  BlockingCollection[120]            │
+       ▼                                     │
+ ┌─────────────────────────────────┐         │
+ │  BACKGROUND THREAD              │         │
+ │  CaptureFolderWriter            │         │
+ │                                 │         │
+ │  temp/{id}/rgb/000000.jpg       │         │
+ │  temp/{id}/rgb/000001.jpg  …    │         │
+ │  temp/{id}/depth/000000.bin     │         │
+ │  temp/{id}/depth/000001.bin  …  │         │
+ └─────────────────────────────────┘         │
+        temp folder on disk                  │
+              │    ┌───────────────────────── ┘
+              │    │  List<SfzFrameRecord>
+              │    │  SfzSessionMetadata
+              ▼    ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │  TASK THREAD                                               │
+ │  ArchiveFinalizer                                          │
+ │                                                            │
+ │  SfzSerializer                                             │
+ │    └─ session.json  (all frame records inline in data[])   │
+ │                                                            │
+ │  greedy bin-pack ─► SfzPartPlan[]                          │
+ │                                                            │
+ │  ┌─ single file ──────────────────────────────────────┐   │
+ │  │  {id}.sfz                                          │   │
+ │  │  └─ session/ ─ session.json  [DEFLATE]             │   │
+ │  │              ─ rgb/NNNNNN.jpg   [STORED]           │   │
+ │  │              ─ depth/NNNNNN.bin [DEFLATE]          │   │
+ │  └────────────────────────────────────────────────────┘   │
+ │  ─ or ─                                                    │
+ │  ┌─ multi-part ───────────────────────────────────────┐   │
+ │  │  {id}-00000-of-N.sfz  session.json + [0,   k)      │   │
+ │  │  {id}-00001-of-N.sfz               + [k,  2k)      │   │
+ │  │  …                                                  │   │
+ │  └────────────────────────────────────────────────────┘   │
+ │                                                            │
+ │  delete temp folder                                        │
+ └───────────────────────────────┬────────────────────────────┘
+                                 │
+                  ┌──────────────▼──────────────────┐
+                  │  MAIN THREAD  (Update() poll)    │
+                  │  RecordingFinalizedEvent(paths)  │
+                  └─────────────────────────────────┘
+```
 
 ## High-Level Flow
 
-The recorder is split into three stages.
+```
+Start Recording
+    │
+    ├─ CaptureCoordinator subscribes to ARCameraManager.frameReceived
+    │
+    ▼ (each AR frame, main thread)
+    ├─ Encode color image → jpg bytes
+    ├─ Acquire depth, convert to float32 metres → raw bytes
+    ├─ Extract camera pose (position + quaternion)
+    ├─ Extract camera intrinsics (fx, fy, cx, cy)
+    ├─ Append SfzFrameRecord to in-memory list
+    └─ Enqueue FrameWriteJob ──► CaptureFolderWriter (background thread)
+                                      │
+                                      └─ writes  temp/{sessionId}/rgb/NNNNNN.jpg
+                                                 temp/{sessionId}/depth/NNNNNN.bin
 
-### 1. Acquisition
+Stop Recording
+    │
+    ├─ Join writer thread (flush pending writes)
+    ├─ Assemble SfzSessionMetadata from observed dimensions
+    └─ Launch ArchiveFinalizer.FinalizeAsync (background Task)
+                │
+                ├─ Build session.json from in-memory frame records
+                ├─ Plan partition (single file or multi-part)
+                ├─ Write .sfz archive(s)
+                └─ Delete temp folder
 
-The acquisition stage reads live ARFoundation data:
+Main thread Update() polls Task completion → fire RecordingFinalizedEvent
+```
 
-- camera image or GPU texture
-- per-frame pose
-- camera intrinsics
-- optional depth
-- optional scanned mesh or scene metadata
+## Output Format: SFZ 1.0
 
-This stage should do minimal work and avoid blocking disk IO, compression, or archive layout decisions.
+The recorder targets SFZ 1.0 as defined by `com.sensorflex.player.unity/Docs/SensorFlexFormat.md`.
 
-### 2. Persistence
+### Archive layout (single-file)
 
-The persistence stage converts live data into a capture-folder layout on device:
+```
+session/
+  session.json          ← all metadata + full frame record array
+  rgb/
+    000000.jpg
+    000001.jpg
+    ...
+  depth/                ← present only when depth was captured
+    000000.bin
+    000001.bin
+    ...
+```
 
-- image files
-- depth files
-- per-frame metadata files
-- session-level `meta.json`
-- optional scene mesh artifacts
+### Archive layout (multi-part)
 
-This stage is allowed to use background workers and bounded queues.
+When `MaxPartSizeMb > 0` and the total session exceeds the limit, output is split:
 
-### 3. Finalization
+```
+{sessionId}-00000-of-NNNNN.sfz   session.json + first frame chunk
+{sessionId}-00001-of-NNNNN.sfz   next frame chunk
+...
+```
 
-After recording stops:
+`session.json` always lives in part 0. It contains a `parts` manifest that maps each frame
+range to its part file. All parts must be present before the player can load the session.
 
-- flush pending writes
-- verify capture completeness
-- write any final manifest metadata
-- package the capture folder into the final `.zip`
+### session.json schema
 
-This stage can run after capture has ended, or on demand as an export step.
+```json
+{
+  "version": "1.0",
+  "session_id": "abc123",
+  "start_time_utc": "2026-05-30T10:30:00.000Z",
+  "device": {
+    "model": "Pixel 7 Pro",
+    "os": "Android OS 13",
+    "ar_framework": "ARCore"
+  },
+  "parts": [ ... ],
+  "tracks": {
+    "frames": {
+      "metadata": {
+        "fps": 30,
+        "channels": {
+          "rgb":   { "width": 1920, "height": 1440, "format": "jpeg" },
+          "depth": { "width": 256,  "height": 192,  "format": "raw_float32_le",
+                     "units": "meters", "sensor": "arcore_environment_depth", "invalid_value": 0.0 }
+        }
+      },
+      "data": [
+        {
+          "timestamp_ns": 178454292513458,
+          "camera": {
+            "pose": { "position": [1.69, 4.42, -1.62], "rotation": [0.12, 0.34, 0.56, 0.75] },
+            "intrinsics": { "fx": 1425.3, "fy": 1425.3, "cx": 954.9, "cy": 725.4 }
+          },
+          "rgb":   { "file": "rgb/000000.jpg" },
+          "depth": { "file": "depth/000000.bin" }
+        },
+        ...
+      ]
+    }
+  }
+}
+```
 
-## Recommended Runtime Modules
+All per-frame metadata (pose, intrinsics, timestamps, file references) is embedded inline in the
+`tracks.frames.data` array. There are no per-frame JSON files on disk.
 
-The runtime can stay small if the design is centered on four modules.
+### Depth encoding
+
+Depth is stored as raw IEEE 754 float32, little-endian, row-major, in metres.
+
+- ARCore (`TryAcquireEnvironmentDepthCpuImage` → uint16 mm): converted to float32 metres at
+  capture time using integer division by 1000.
+- ARKit (`XRCpuImage` with 4-byte pixel stride, already float32 metres): copied directly.
+
+Invalid/no-return pixels are represented as `0.0`.
+
+### Coordinate system
+
+Follows the Unity world-space convention (left-handed, +Y up, +Z forward, metres). Pose
+`position` and `rotation` are read directly from `Camera.transform.position` and
+`Camera.transform.rotation` and written as-is.
+
+### Zip compression per entry type
+
+| Entry              | Method     | Reason                                      |
+|--------------------|------------|---------------------------------------------|
+| `session.json`     | DEFLATE    | Text compresses well                        |
+| `rgb/NNNNNN.jpg`   | STORED     | JPEG is already compressed                  |
+| `depth/NNNNNN.bin` | DEFLATE    | Float32 depth compresses significantly      |
+
+## Runtime Modules
 
 ### `ARSensorFlexRecorder`
 
-Scene-facing component that owns recorder lifecycle.
+Scene-facing MonoBehaviour attached to `XROrigin`. Owns the recording lifecycle.
 
 Responsibilities:
+- Expose all configuration through Inspector fields.
+- Validate subsystem availability before starting.
+- Coordinate `CaptureCoordinator` and `ArchiveFinalizer`.
+- Poll the finalization `Task` in `Update()` and fire events on the main thread.
 
-- start and stop recording
-- resolve scene references such as `ARSession`, `XROrigin`, camera, and optional mesh source
-- expose recorder settings directly in the Inspector
-- coordinate the other modules
+Inspector fields:
 
-This should be the only component most users need to attach.
+| Field             | Default               | Description                                    |
+|-------------------|-----------------------|------------------------------------------------|
+| TargetFPS         | 30                    | Nominal capture rate written into session.json |
+| SessionId         | _(auto UUID)_         | Override to use a fixed session identifier     |
+| CaptureColor      | true                  | Write RGB frames                               |
+| CaptureDepth      | true                  | Write depth frames when available              |
+| CapturePose       | true                  | Record camera pose per frame                   |
+| CaptureIntrinsics | true                  | Record intrinsics per frame                    |
+| OutputDirectory   | SensorFlexRecordings  | Relative to persistentDataPath, or absolute    |
+| MaxPartSizeMb     | 500                   | 0 = single file; > 0 = split at this limit     |
+| RecordOnStart     | false                 | Auto-start once the camera subsystem is ready  |
+
+Events:
+
+| Event                    | Argument         | When fired                                  |
+|--------------------------|------------------|---------------------------------------------|
+| `RecordingStartedEvent`  | `string tempDir` | Immediately after capture begins            |
+| `RecordingFinalizedEvent`| `string[] paths` | On main thread when .sfz files are written  |
+| `RecordingFailedEvent`   | `string error`   | On start failure or finalization exception  |
 
 ### `CaptureCoordinator`
 
-Internal orchestrator for a single recording session.
+Internal class; one instance per recording session.
 
 Responsibilities:
+- Locate `ARCameraManager` and `AROcclusionManager` from the `XROrigin` camera.
+- Subscribe to / unsubscribe from `ARCameraManager.frameReceived`.
+- Encode each color frame to JPEG on the main thread (CPU image path preferred; texture blit fallback).
+- Convert depth to float32 metres on the main thread.
+- Accumulate `List<SfzFrameRecord>` in memory.
+- Route binary data to `CaptureFolderWriter`.
+- Expose `SessionMetadata` and `FrameRecords` after `StopCapture()`.
 
-- subscribe to ARFoundation producers
-- build per-frame capture records
-- route capture data to staging queues
-- own session identifiers, timestamps, and frame indices
-
-This is the boundary between Unity/ARFoundation callbacks and the recorder pipeline.
+Frame record accumulation is the reason per-frame JSON files are not needed: the coordinator
+maintains the full metadata list in memory and hands it off to the finalizer in one shot.
 
 ### `CaptureFolderWriter`
 
-Background-oriented writer that persists capture data to disk.
+Background-thread disk writer.
 
 Responsibilities:
-
-- create the session folder
-- write RGB, depth, metadata, and mesh files
-- maintain bounded queues and backpressure policy
-- guarantee on-disk consistency at stop/finalize time
-
-This is the main durability layer during live recording.
+- Create `rgb/` and `depth/` subdirectories inside the temp folder.
+- Accept `FrameWriteJob` items from a bounded `BlockingCollection<>` (capacity 120).
+- Write `rgb/NNNNNN.jpg` and `depth/NNNNNN.bin` on a dedicated worker thread.
+- When the queue is full, the producer drops the frame and logs a warning rather than blocking
+  the main thread.
+- On `Stop()`, mark the queue complete and `Join` the thread with a 10-second timeout to flush
+  all pending writes.
 
 ### `ArchiveFinalizer`
 
-Post-recording packager that creates the final player archive.
+Post-recording packager.
 
 Responsibilities:
+- Accept the temp folder, session metadata, and frame record list from the coordinator.
+- Build `session.json` bytes using `SfzSerializer`.
+- Collect on-disk file sizes to plan the partition (if `maxPartSizeBytes > 0`).
+- Write one or more `.sfz` files using `System.IO.Compression.ZipArchive` with per-entry
+  compression levels.
+- Delete the temp folder after successful packaging.
+- Run entirely on a background `Task`; the result is polled from `ARSensorFlexRecorder.Update()`.
 
-- read the capture folder
-- verify required files are present
-- write or update top-level `meta.json` if needed
-- generate the final `.zip` using `System.IO.Compression.ZipArchive`
+#### Multi-part algorithm
 
-This module should not be part of the hot path.
+1. Compute `session.json` bytes (without parts manifest) → get byte length.
+2. Collect `(rgbSize, depthSize)` for each frame from the temp folder.
+3. Greedy bin-pack: iterate frames in order, accumulate size, start a new part when the
+   current part would exceed `maxPartSizeBytes`. A single frame is never split across parts.
+4. Assign `{sessionId}-{p:D5}-of-{total:D5}.sfz` filenames.
+5. Rebuild `session.json` with the `parts` manifest.
+6. Write each part zip, placing `session.json` only in part 0.
+
+### `SfzSerializer` (`RecorderJsonSerializer.cs`)
+
+Internal static class.
+
+Responsibilities:
+- Build the complete `session.json` byte array from `SfzSessionMetadata`,
+  `List<SfzFrameRecord>`, and an optional `SfzPartPlan[]`.
+- Serialize frame records compactly (one JSON object per line in the `data` array).
+- No external JSON library; manual `StringBuilder` serialization with `G9`-formatted floats.
 
 ## Data Model
 
-The recorder should distinguish between two kinds of data.
+### `SfzFrameRecord` (struct)
 
-### Session Data
+In-memory representation of one captured frame. Kept in a `List<SfzFrameRecord>` during recording.
 
-Written once or updated infrequently:
+| Field          | Type       | Description                              |
+|----------------|------------|------------------------------------------|
+| FrameIndex     | int        | Zero-based sequential index              |
+| TimestampNs    | long       | `ARCameraFrameEventArgs.timestampNs`     |
+| Position       | Vector3    | Camera world position (metres)           |
+| Rotation       | Quaternion | Camera world rotation                    |
+| HasIntrinsics  | bool       |                                          |
+| Fx, Fy, Cx, Cy | float      | Camera intrinsics in pixels              |
+| HasColor       | bool       | Whether `rgb/NNNNNN.jpg` was written     |
+| HasDepth       | bool       | Whether `depth/NNNNNN.bin` was written   |
 
-- scene id
-- capture device metadata
-- coordinate system metadata
-- capture FPS target
-- mesh metadata
-- stream availability flags
+Memory cost: ~64 bytes × frame count. At 30 fps for 10 minutes: ~18,000 frames ≈ 1.1 MB.
 
-This becomes top-level archive metadata.
+### `SfzSessionMetadata` (struct)
 
-### Frame Data
+Session-level info assembled at `StopCapture()` time.
 
-Written for each frame:
+Includes: session id, UTC start time, device model, OS string, AR framework name, FPS target,
+and the RGB + depth dimensions observed from the first successful frames.
 
-- `rgb.jpg`
-- `meta.json`
-- optional `depth.bin`
+### `SfzPartPlan` (struct)
 
-Frame metadata should include:
+One element of the multi-part partition plan.
 
-- frame index
-- timestamp
-- camera pose
-- camera intrinsics
-- image dimensions
-- optional depth metadata
-
-## On-Disk Capture Format
-
-During recording, write to a plain folder using the same logical layout as the player archive.
-
-Example:
-
-```text
-capture_root/
-  scene_001/
-    meta.json
-    frames/
-      000000/
-        rgb.jpg
-        meta.json
-        depth.bin
-      000001/
-        rgb.jpg
-        meta.json
-    mesh/
-      scanned_mesh.ply
-```
-
-Using the archive layout as the folder layout has two advantages:
-
-- packaging becomes a straightforward zip step
-- inspection and debugging are much easier
-
-## Why Folder-First Instead Of Zip-First
-
-Live zip writing is possible, but it is not the preferred architecture.
-
-Problems with zip-first recording:
-
-- compression adds CPU cost in the hot path
-- frequent small-entry writes are inefficient
-- partially written archives are harder to recover
-- interruption handling is worse
-- debugging captured artifacts is much harder
-
-Advantages of folder-first recording:
-
-- simpler live writer
-- better failure recovery
-- easy to inspect and validate output
-- final zip packaging can run after capture ends
-
-## Performance Strategy
-
-The recorder should assume that camera capture and disk writes run at different speeds.
-
-Recommended approach:
-
-- main thread acquires frame references and lightweight metadata only
-- expensive image encoding happens off the critical path when possible
-- disk writes use a bounded queue
-- if the queue fills, apply an explicit policy:
-  - drop frames
-  - reduce capture rate
-  - or stop recording with a clear error
-
-The system should not silently accumulate unbounded memory.
+| Field      | Description                                 |
+|------------|---------------------------------------------|
+| FileName   | Basename of the output .sfz file            |
+| FrameStart | First frame index in this part (inclusive)  |
+| FrameEnd   | Last frame index in this part (exclusive)   |
 
 ## Threading Model
 
-Suggested threading model:
+| Thread       | Work                                                                 |
+|--------------|----------------------------------------------------------------------|
+| Main thread  | ARFoundation callbacks, image encoding, depth conversion, record accumulation |
+| Writer thread| `CaptureFolderWriter.WriteLoop` — disk IO for jpg and bin files     |
+| Task thread  | `ArchiveFinalizer.Finalize` — session.json build + zip writing       |
 
-- main thread:
-  - ARFoundation callbacks
-  - frame index assignment
-  - minimal metadata extraction
-- worker thread or task queue:
-  - image encoding
-  - depth serialization
-  - disk writes
-- finalization task:
-  - validation
-  - zip packaging
+Unity objects (`Texture2D`, `XRCpuImage`, `Camera.transform`) are always accessed on the
+main thread. The writer and finalizer threads only see plain byte arrays and value-type structs.
 
-Unity object access should remain on the main thread unless data has been copied into plain managed/native buffers first.
+## Intrinsics Fallback Chain
 
-## Crash Safety
+Per-frame intrinsics are resolved in this priority order:
 
-The recorder should be able to recover useful data from an interrupted capture.
+1. `XRCameraSubsystem.TryGetIntrinsics()` — native subsystem values (most accurate)
+2. Camera FOV + frame dimensions — approximate estimate
+3. Last valid intrinsics — reused when the above two fail mid-session
 
-Recommended safeguards:
+## Temp Folder Location
 
-- create a session folder immediately on start
-- write files incrementally as frames are captured
-- maintain a small session manifest or status file
-- mark the capture as complete only after final flush succeeds
+`Application.temporaryCachePath/SF-Recorder/{sessionId}/`
 
-This allows:
+The OS may reclaim this path if the process is killed. Incomplete temp folders are not
+automatically cleaned up in that case, but the finalizer will fail with a clear error.
+The folder is deleted automatically after successful finalization.
 
-- partial recovery
-- easier debugging of failed captures
-- optional later repackaging of an incomplete session
+## Scene Setup
 
-## Initial Scope Recommendation
+Attach `ARSensorFlexRecorder` to the `XROrigin` GameObject (not to `ARSession`):
 
-For the first implementation, keep the supported streams narrow.
+```
+XROrigin  ← ARSensorFlexRecorder
+  └─ Camera
+       ├─ ARCameraManager
+       └─ AROcclusionManager  (optional, for depth)
+```
 
-Phase 1:
+The component locates `ARCameraManager` and `AROcclusionManager` by walking down from the
+`XROrigin` camera. No explicit scene references are required.
 
-- RGB frames
-- pose
-- intrinsics
-- top-level session metadata
-- zip finalization
+## Relationship to the Player
 
-Phase 2:
+The recorder targets SFZ 1.0 exactly. The player's `SfzFileBackend` and `FileIoBackend`
+(in `SfzSessionStore.cs`) define the contract:
 
-- depth
-- scanned mesh export
-- validation tooling
-- recovery and resume improvements
+- `session/session.json` must be present and parse as `SfzSessionJson`.
+- `tracks.frames.data[i].rgb.file` resolves relative to `session/`.
+- `tracks.frames.data[i].depth.file` resolves relative to `session/` (absent when not captured).
+- Pose `position` and `rotation` map to `Matrix4x4.TRS(position, quaternion, Vector3.one)`.
+- Intrinsics `{fx, fy, cx, cy}` map to `new Vector4(fx, fy, cx, cy)`.
 
-## Scene Setup Recommendation
+The temp folder layout mirrors the SFZ `session/` layout, so an unfinalized session can be
+loaded directly via the player's `FileIo` source mode for development and debugging.
 
-Recorder scene setup should be simple.
+## Phase 2 (Future)
 
-- `ARSession` with `ARSensorFlexRecorder`
-- `XROrigin`
-- optional mesh-export helper component if scanned mesh capture is enabled
-
-The recorder should use explicit scene references where ambiguity is possible, especially for `XROrigin` and camera source selection.
-
-## Relationship To The Player
-
-The recorder should target the same logical package format that the player expects.
-
-That means:
-
-- same top-level `meta.json` concepts
-- same frame folder structure
-- same per-frame metadata schema
-- same mesh metadata references
-
-The player archive format should be the source of truth for exported capture layout. The recorder’s live folder format should mirror that layout as closely as possible.
-
-## Summary
-
-This recorder should not be designed as “zip writer plus ARFoundation hooks.”
-
-It should be designed as:
-
-- a real-time acquisition layer
-- a durable folder writer
-- a post-recording archive finalizer
-
-That is the standard recording-system shape, and it is the right tradeoff for performance, reliability, and compatibility with the SensorFlex player format.
+- Scanned mesh export via `ARMeshManager` — write `scene_mesh.ply`, add `attachments.scene_mesh`
+  to `session.json`, support multi-part attachment chunking.
+- FPS throttling — currently captures every available AR frame; add frame-skip logic to enforce
+  `TargetFPS` when the device runs faster.
+- Partial session recovery — detect incomplete temp folders on next app launch and offer
+  to re-run finalization.
