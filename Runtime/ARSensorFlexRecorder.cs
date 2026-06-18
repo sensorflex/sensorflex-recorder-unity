@@ -76,6 +76,9 @@ namespace SensorFlex.Recorder
         internal bool   CaptureDepth      => m_CaptureDepth;
         internal bool   CapturePose       => m_CapturePose;
         internal bool   CaptureIntrinsics => m_CaptureIntrinsics;
+        internal string OutputDirectory   => Path.IsPathRooted(m_OutputDirectory)
+                                                ? m_OutputDirectory
+                                                : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
 
         // ── Private ────────────────────────────────────────────────────────
 
