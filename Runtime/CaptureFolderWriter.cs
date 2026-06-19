@@ -3,104 +3,192 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Threading;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 
 namespace SensorFlex.Recorder
 {
-    // Writes rgb/NNNNNN.jpg and depth/NNNNNN.bin to disk on a background thread.
-    // All frame metadata lives in-memory in CaptureCoordinator; this class only
-    // handles binary file persistence.
+    // Two encoder threads convert raw RGBA frames to JPEG in parallel.
+    // A single writer thread drains encoded frames in frame-index order and appends
+    // them to binary stream files, eliminating per-frame file-create overhead.
+    //
+    // Stream format (rgb.stream and depth.stream):
+    //   [int32 dataSize][dataSize bytes payload]  repeated per frame in order.
+    //   dataSize == 0 means no data for that frame.
     internal sealed class CaptureFolderWriter
     {
-        public struct FrameWriteJob
+        public struct RawFrameJob
         {
             public int    FrameIndex;
-            public byte[] JpgData;       // null when color not captured
-            public byte[] DepthF32Data;  // raw_float32_le meters; null when depth not captured
+            public byte[] RgbaData;     // raw RGBA32 pixels; null if JpgData is set
+            public uint   RgbaWidth;
+            public uint   RgbaHeight;
+            public byte[] JpgData;      // pre-encoded JPEG (GPU texture fallback only)
+            public byte[] DepthData;    // raw float32 LE metres; null when depth not captured
         }
 
-        readonly string _rgbDir;
-        readonly string _depthDir;
-        readonly BlockingCollection<FrameWriteJob> _queue;
-
-        Thread _workerThread;
-        bool   _isRunning;
-
-        // Frames further ahead than this from the playhead are held back to avoid
-        // unbounded memory growth on the producer side.
-        const int MaxQueueSize = 120;
-
-        public CaptureFolderWriter(string sessionTempDir)
+        struct EncodedSlot
         {
-            _rgbDir   = Path.Combine(sessionTempDir, "rgb");
-            _depthDir = Path.Combine(sessionTempDir, "depth");
+            public int    FrameIndex;
+            public byte[] JpgData;
+            public byte[] DepthData;
+        }
 
-            Directory.CreateDirectory(sessionTempDir);
-            Directory.CreateDirectory(_rgbDir);
-            Directory.CreateDirectory(_depthDir);
+        // ── Output paths ───────────────────────────────────────────────────
+        public string RgbStreamPath   { get; }
+        public string DepthStreamPath { get; }
 
-            _queue = new BlockingCollection<FrameWriteJob>(MaxQueueSize);
+        // ── Threading ──────────────────────────────────────────────────────
+        const int RawQueueCapacity = 16;
+
+        BlockingCollection<RawFrameJob>        _rawQueue;
+        ConcurrentDictionary<int, EncodedSlot> _encodedSlots;
+        Thread   _encoderThread1, _encoderThread2, _writerThread;
+        volatile bool _stopWriter;
+
+        // Writer thread owns these exclusively after Start().
+        BinaryWriter _rgbWriter;
+        BinaryWriter _depthWriter;
+
+        public CaptureFolderWriter(string tempDir)
+        {
+            Directory.CreateDirectory(tempDir);
+            RgbStreamPath   = Path.Combine(tempDir, "rgb.stream");
+            DepthStreamPath = Path.Combine(tempDir, "depth.stream");
         }
 
         public void Start()
         {
-            _isRunning    = true;
-            _workerThread = new Thread(WriteLoop)
+            _rawQueue     = new BlockingCollection<RawFrameJob>(RawQueueCapacity);
+            _encodedSlots = new ConcurrentDictionary<int, EncodedSlot>();
+            _stopWriter   = false;
+
+            const int bufSize = 1 << 17; // 128 KB write buffer
+            _rgbWriter   = new BinaryWriter(new FileStream(RgbStreamPath,   FileMode.Create, FileAccess.Write, FileShare.None, bufSize));
+            _depthWriter = new BinaryWriter(new FileStream(DepthStreamPath, FileMode.Create, FileAccess.Write, FileShare.None, bufSize));
+
+            _writerThread   = new Thread(WriterLoop)  { IsBackground = true, Name = "SF-Writer" };
+            _encoderThread1 = new Thread(EncoderLoop) { IsBackground = true, Name = "SF-Encoder-1" };
+            _encoderThread2 = new Thread(EncoderLoop) { IsBackground = true, Name = "SF-Encoder-2" };
+
+            _writerThread.Start();
+            _encoderThread1.Start();
+            _encoderThread2.Start();
+        }
+
+        // Called on main thread. Returns false only if raw queue is full (capacity 16).
+        // With two encoder threads at camera FPS this should never happen in practice.
+        public bool TryEnqueue(RawFrameJob job) => _rawQueue?.TryAdd(job) ?? false;
+
+        // Signal encoders that no more frames are coming. Returns immediately;
+        // call WaitForFlush() on a background thread to wait for all writes to complete.
+        public void CompleteAdding() => _rawQueue?.CompleteAdding();
+
+        // Blocks until all frames are encoded and flushed to disk. Call off main thread.
+        public void WaitForFlush(int timeoutMs = 30_000)
+        {
+            _encoderThread1?.Join(timeoutMs);
+            _encoderThread2?.Join(timeoutMs);
+            _stopWriter = true;
+            _writerThread?.Join(timeoutMs);
+
+            _rgbWriter?.Flush();
+            _rgbWriter?.Dispose();
+            _depthWriter?.Flush();
+            _depthWriter?.Dispose();
+            _rgbWriter   = null;
+            _depthWriter = null;
+
+            _rawQueue?.Dispose();
+            _rawQueue = null;
+        }
+
+        // ── Encoder threads ────────────────────────────────────────────────
+
+        void EncoderLoop()
+        {
+            try
             {
-                IsBackground = true,
-                Name         = "SF-Recorder-DiskWriter"
-            };
-            _workerThread.Start();
+                foreach (var job in _rawQueue.GetConsumingEnumerable())
+                {
+                    byte[] jpg = job.JpgData;
+                    if (jpg == null && job.RgbaData != null)
+                        jpg = ImageConversion.EncodeArrayToJPG(
+                            job.RgbaData, GraphicsFormat.R8G8B8A8_UNorm,
+                            job.RgbaWidth, job.RgbaHeight, 0, 75);
+
+                    _encodedSlots[job.FrameIndex] = new EncodedSlot
+                    {
+                        FrameIndex = job.FrameIndex,
+                        JpgData    = jpg,
+                        DepthData  = job.DepthData
+                    };
+                }
+            }
+            catch (Exception e) when (e is not ThreadAbortException)
+            {
+                Debug.LogError($"[SF-Recorder] Encoder thread error: {e.Message}");
+            }
         }
 
-        // Returns false when the queue is full — the caller should drop the frame
-        // rather than blocking the main thread.
-        public bool TryEnqueue(FrameWriteJob job)
-        {
-            if (!_isRunning || _queue.IsAddingCompleted)
-                return false;
-            return _queue.TryAdd(job);
-        }
+        // ── Writer thread ──────────────────────────────────────────────────
 
-        // Stop accepting new jobs and wait for the background thread to flush all
-        // pending writes before returning.
-        public void Stop()
+        void WriterLoop()
         {
-            _isRunning = false;
-            _queue.CompleteAdding();
-            _workerThread?.Join(10_000);
-            _queue.Dispose();
-        }
+            int nextWrite = 0;
 
-        void WriteLoop()
-        {
             while (true)
             {
-                FrameWriteJob job;
-                try
+                // Drain all consecutive ready frames from the reorder map.
+                bool wrote = false;
+                while (_encodedSlots.TryRemove(nextWrite, out var slot))
                 {
-                    if (!_queue.TryTake(out job, Timeout.Infinite))
-                        break;
+                    WriteSlot(slot);
+                    nextWrite++;
+                    wrote = true;
                 }
-                catch (InvalidOperationException)
-                {
-                    // Queue was completed and is now empty.
+
+                if (_stopWriter && _encodedSlots.IsEmpty)
                     break;
-                }
 
-                string stem = job.FrameIndex.ToString("D6");
+                if (!wrote)
+                    Thread.Sleep(1);
+            }
 
-                try
+            // Final drain — encoders are confirmed done when _stopWriter is set.
+            while (_encodedSlots.TryRemove(nextWrite, out var slot))
+            {
+                WriteSlot(slot);
+                nextWrite++;
+            }
+        }
+
+        void WriteSlot(EncodedSlot slot)
+        {
+            try
+            {
+                if (slot.JpgData != null && slot.JpgData.Length > 0)
                 {
-                    if (job.JpgData != null && job.JpgData.Length > 0)
-                        File.WriteAllBytes(Path.Combine(_rgbDir, stem + ".jpg"), job.JpgData);
-
-                    if (job.DepthF32Data != null && job.DepthF32Data.Length > 0)
-                        File.WriteAllBytes(Path.Combine(_depthDir, stem + ".bin"), job.DepthF32Data);
+                    _rgbWriter.Write(slot.JpgData.Length);
+                    _rgbWriter.Write(slot.JpgData);
                 }
-                catch (Exception e)
+                else
                 {
-                    Debug.LogError($"[SF-Recorder] Disk write failed for frame {job.FrameIndex}: {e.Message}");
+                    _rgbWriter.Write(0);
                 }
+
+                if (slot.DepthData != null && slot.DepthData.Length > 0)
+                {
+                    _depthWriter.Write(slot.DepthData.Length);
+                    _depthWriter.Write(slot.DepthData);
+                }
+                else
+                {
+                    _depthWriter.Write(0);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[SF-Recorder] Write failed for frame {slot.FrameIndex}: {e.Message}");
             }
         }
     }

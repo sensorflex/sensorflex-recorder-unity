@@ -13,29 +13,28 @@ namespace SensorFlex.Recorder
     //
     // Single-file mode  (maxPartSizeBytes <= 0):
     //   {outputDir}/{sessionId}.sfz
-    //   session.json has no "parts" key.
     //
     // Multi-part mode   (maxPartSizeBytes >  0):
-    //   {outputDir}/{sessionId}-00000-of-NNNNN.sfz
-    //   {outputDir}/{sessionId}-00001-of-NNNNN.sfz
-    //   ...
+    //   {outputDir}/{sessionId}-00000-of-NNNNN.sfz  ...
     //   session.json in part 0 carries a "parts" manifest.
-    //   Part naming follows the SFZ spec: -DDDDD-of-DDDDD suffix.
     //
-    // All frame files inside the archive live under the "session/" prefix as
-    // required by the player's SfzFileBackend.
+    // Temp folder layout produced by CaptureFolderWriter:
+    //   rgb.stream   — [int32 size][size bytes JPEG] per frame, in order
+    //   depth.stream — [int32 size][size bytes float32] per frame, in order
     internal static class ArchiveFinalizer
     {
+        // (frameByteOffset, dataSize) into a binary stream for one frame.
+        struct FrameInfo { public long Offset; public int Size; }
+
         public static Task<string[]> FinalizeAsync(
             string tempDir,
             string outputDir,
             SfzSessionMetadata meta,
             List<SfzFrameRecord> frameRecords,
+            CaptureFolderWriter writer,
             long maxPartSizeBytes)
         {
-            // Capture everything the background task needs; avoid captures of large
-            // managed objects that could keep the main thread live longer than needed.
-            return Task.Run(() => Finalize(tempDir, outputDir, meta, frameRecords, maxPartSizeBytes));
+            return Task.Run(() => Finalize(tempDir, outputDir, meta, frameRecords, writer, maxPartSizeBytes));
         }
 
         // ── Core (background thread) ───────────────────────────────────────
@@ -45,70 +44,92 @@ namespace SensorFlex.Recorder
             string outputDir,
             SfzSessionMetadata meta,
             List<SfzFrameRecord> frameRecords,
+            CaptureFolderWriter writer,
             long maxPartSizeBytes)
         {
+            // Wait for writer to finish flushing before reading the streams.
+            writer?.WaitForFlush();
+
             if (!Directory.Exists(tempDir))
                 throw new DirectoryNotFoundException($"[SF-Recorder] Temp dir not found: {tempDir}");
 
             Directory.CreateDirectory(outputDir);
 
-            // Collect on-disk file sizes for the partition planner.
-            // We only need sizes, not the bytes themselves; the zip writer streams
-            // each file directly from disk so we don't hold large buffers in RAM.
-            var frameSizes = CollectFrameSizes(tempDir, frameRecords);
+            string rgbStreamPath   = Path.Combine(tempDir, "rgb.stream");
+            string depthStreamPath = Path.Combine(tempDir, "depth.stream");
+
+            var rgbInfo   = ScanStream(rgbStreamPath,   frameRecords.Count);
+            var depthInfo = ScanStream(depthStreamPath, frameRecords.Count);
+
+            var frameSizes = ComputeFrameSizes(frameRecords, rgbInfo, depthInfo);
 
             string[] outputPaths;
 
             if (maxPartSizeBytes <= 0)
             {
-                // ── Single file ────────────────────────────────────────────
                 byte[] sessionJsonBytes = SfzSerializer.BuildSessionJson(meta, frameRecords, null);
                 string outPath = Path.Combine(outputDir, meta.SessionId + ".sfz");
-                WritePart(outPath, sessionJsonBytes, frameRecords, 0, frameRecords.Count, tempDir);
+                WritePart(outPath, sessionJsonBytes, frameRecords, 0, frameRecords.Count,
+                          rgbStreamPath, depthStreamPath, rgbInfo, depthInfo);
                 outputPaths = new[] { outPath };
                 Debug.Log($"[SF-Recorder] SFZ written: {outPath} ({new FileInfo(outPath).Length / 1024} KB)");
             }
             else
             {
-                // ── Multi-part ─────────────────────────────────────────────
-                //
-                // Step 1: compute session.json without parts → get its byte size.
-                byte[] jsonNoParts = SfzSerializer.BuildSessionJson(meta, frameRecords, null);
-                long   jsonSize    = jsonNoParts.Length;
-
-                // Step 2: plan partition.
-                var plan = PlanPartition(frameRecords, frameSizes, jsonSize, maxPartSizeBytes, meta.SessionId);
-
-                // Step 3: rebuild session.json with the parts manifest (part 0 only).
+                byte[] jsonNoParts  = SfzSerializer.BuildSessionJson(meta, frameRecords, null);
+                var    plan         = PlanPartition(frameRecords, frameSizes, jsonNoParts.Length, maxPartSizeBytes, meta.SessionId);
                 byte[] sessionJsonBytes = SfzSerializer.BuildSessionJson(meta, frameRecords, plan);
 
-                // Step 4: write each part.
                 outputPaths = new string[plan.Length];
                 for (int p = 0; p < plan.Length; p++)
                 {
                     string outPath = Path.Combine(outputDir, plan[p].FileName);
-                    bool   isPart0 = p == 0;
-                    WritePart(
-                        outPath,
-                        isPart0 ? sessionJsonBytes : null,
-                        frameRecords,
-                        plan[p].FrameStart,
-                        plan[p].FrameEnd,
-                        tempDir);
+                    WritePart(outPath,
+                              p == 0 ? sessionJsonBytes : null,
+                              frameRecords,
+                              plan[p].FrameStart, plan[p].FrameEnd,
+                              rgbStreamPath, depthStreamPath, rgbInfo, depthInfo);
                     outputPaths[p] = outPath;
                     Debug.Log($"[SF-Recorder] SFZ part {p + 1}/{plan.Length}: {outPath} ({new FileInfo(outPath).Length / 1024} KB)");
                 }
             }
 
-            // Clean up temp folder.
             TryDeleteDir(tempDir);
-
             return outputPaths;
+        }
+
+        // ── Stream scanning ────────────────────────────────────────────────
+
+        // Scans a length-prefixed binary stream and returns (dataOffset, dataSize)
+        // for each frame. dataOffset points past the 4-byte length prefix.
+        static FrameInfo[] ScanStream(string path, int frameCount)
+        {
+            var info = new FrameInfo[frameCount];
+            if (!File.Exists(path)) return info;
+
+            using var fs = File.OpenRead(path);
+            using var br = new BinaryReader(fs);
+
+            for (int i = 0; i < frameCount && fs.Position < fs.Length; i++)
+            {
+                int  size   = br.ReadInt32();
+                long offset = fs.Position; // data starts here (after the 4-byte length)
+                info[i] = new FrameInfo { Offset = offset, Size = size };
+                fs.Seek(size, SeekOrigin.Current);
+            }
+            return info;
+        }
+
+        static long[] ComputeFrameSizes(List<SfzFrameRecord> records, FrameInfo[] rgb, FrameInfo[] depth)
+        {
+            var sizes = new long[records.Count];
+            for (int i = 0; i < records.Count; i++)
+                sizes[i] = rgb[i].Size + depth[i].Size;
+            return sizes;
         }
 
         // ── Partition planning ─────────────────────────────────────────────
 
-        // Returns a minimal array of SfzPartPlan; always at least one element.
         static SfzPartPlan[] PlanPartition(
             List<SfzFrameRecord> frameRecords,
             long[] frameSizes,
@@ -116,18 +137,13 @@ namespace SensorFlex.Recorder
             long maxPartSizeBytes,
             string sessionId)
         {
-            var plans = new List<SfzPartPlan>();
-
-            // Part 0 carries session.json; account for its size upfront.
-            long currentSize  = jsonSize;
-            int  partStart    = 0;
+            var  plans       = new List<SfzPartPlan>();
+            long currentSize = jsonSize;
+            int  partStart   = 0;
 
             for (int i = 0; i < frameSizes.Length; i++)
             {
                 long fSize = frameSizes[i];
-
-                // If adding this frame would overflow the part (and the part already
-                // has at least one frame), close the current part and open a new one.
                 if (i > partStart && currentSize + fSize > maxPartSizeBytes)
                 {
                     plans.Add(new SfzPartPlan { FrameStart = partStart, FrameEnd = i });
@@ -139,15 +155,8 @@ namespace SensorFlex.Recorder
                     currentSize += fSize;
                 }
             }
+            plans.Add(new SfzPartPlan { FrameStart = partStart, FrameEnd = frameRecords.Count });
 
-            // Close the final (or only) part.
-            plans.Add(new SfzPartPlan
-            {
-                FrameStart = partStart,
-                FrameEnd   = frameRecords.Count
-            });
-
-            // Assign filenames now that we know total part count.
             int total = plans.Count;
             for (int p = 0; p < total; p++)
             {
@@ -155,63 +164,24 @@ namespace SensorFlex.Recorder
                 plan.FileName = $"{sessionId}-{p:D5}-of-{total:D5}.sfz";
                 plans[p] = plan;
             }
-
             return plans.ToArray();
-        }
-
-        // Estimates the raw (uncompressed) byte cost for each frame record.
-        // RGB files are stored with ZIP_STORED so zip size ≈ file size.
-        // Depth files compress well, but we use raw size as an upper bound.
-        static long[] CollectFrameSizes(string tempDir, List<SfzFrameRecord> frameRecords)
-        {
-            string rgbDir   = Path.Combine(tempDir, "rgb");
-            string depthDir = Path.Combine(tempDir, "depth");
-
-            var sizes = new long[frameRecords.Count];
-
-            for (int i = 0; i < frameRecords.Count; i++)
-            {
-                var rec  = frameRecords[i];
-                string stem = rec.FrameIndex.ToString("D6");
-
-                if (rec.HasColor)
-                {
-                    string path = Path.Combine(rgbDir, stem + ".jpg");
-                    if (File.Exists(path)) sizes[i] += new FileInfo(path).Length;
-                }
-                if (rec.HasDepth)
-                {
-                    string path = Path.Combine(depthDir, stem + ".bin");
-                    if (File.Exists(path)) sizes[i] += new FileInfo(path).Length;
-                }
-            }
-
-            return sizes;
         }
 
         // ── Zip writing ────────────────────────────────────────────────────
 
-        // Writes one .sfz part file.
-        //   sessionJsonBytes — non-null only for part 0 (single-file or first part).
-        //   frameStart/frameEnd — slice of frameRecords whose binary files go here.
         static void WritePart(
             string outPath,
             byte[] sessionJsonBytes,
             List<SfzFrameRecord> frameRecords,
-            int frameStart,
-            int frameEnd,
-            string tempDir)
+            int frameStart, int frameEnd,
+            string rgbStreamPath, string depthStreamPath,
+            FrameInfo[] rgbInfo, FrameInfo[] depthInfo)
         {
-            string rgbDir   = Path.Combine(tempDir, "rgb");
-            string depthDir = Path.Combine(tempDir, "depth");
-
-            if (File.Exists(outPath))
-                File.Delete(outPath);
+            if (File.Exists(outPath)) File.Delete(outPath);
 
             using var zipStream = new FileStream(outPath, FileMode.Create, FileAccess.Write);
             using var archive   = new ZipArchive(zipStream, ZipArchiveMode.Create);
 
-            // session.json (Deflate — compresses well)
             if (sessionJsonBytes != null)
             {
                 var entry = archive.CreateEntry("session/session.json", SysCompressionLevel.Optimal);
@@ -219,39 +189,45 @@ namespace SensorFlex.Recorder
                 es.Write(sessionJsonBytes, 0, sessionJsonBytes.Length);
             }
 
-            // Frame binary files
+            using var rgbStream   = File.Exists(rgbStreamPath)   ? File.OpenRead(rgbStreamPath)   : null;
+            using var depthStream = File.Exists(depthStreamPath) ? File.OpenRead(depthStreamPath) : null;
+
+            var copyBuf = new byte[65536];
+
             for (int i = frameStart; i < frameEnd; i++)
             {
-                var rec  = frameRecords[i];
+                var    rec  = frameRecords[i];
                 string stem = rec.FrameIndex.ToString("D6");
 
-                if (rec.HasColor)
+                if (rec.HasColor && rgbStream != null && rgbInfo[i].Size > 0)
                 {
-                    string src = Path.Combine(rgbDir, stem + ".jpg");
-                    if (File.Exists(src))
-                    {
-                        // JPEGs are already compressed — use NoCompression (ZIP_STORED).
-                        var entry = archive.CreateEntry("session/rgb/" + stem + ".jpg",
-                                                        SysCompressionLevel.NoCompression);
-                        using var es = entry.Open();
-                        using var fs = File.OpenRead(src);
-                        fs.CopyTo(es);
-                    }
+                    var entry = archive.CreateEntry("session/rgb/" + stem + ".jpg",
+                                                    SysCompressionLevel.NoCompression);
+                    using var es = entry.Open();
+                    rgbStream.Seek(rgbInfo[i].Offset, SeekOrigin.Begin);
+                    CopyBytes(rgbStream, es, rgbInfo[i].Size, copyBuf);
                 }
 
-                if (rec.HasDepth)
+                if (rec.HasDepth && depthStream != null && depthInfo[i].Size > 0)
                 {
-                    string src = Path.Combine(depthDir, stem + ".bin");
-                    if (File.Exists(src))
-                    {
-                        // Raw float32 depth compresses well under Deflate.
-                        var entry = archive.CreateEntry("session/depth/" + stem + ".bin",
-                                                        SysCompressionLevel.Optimal);
-                        using var es = entry.Open();
-                        using var fs = File.OpenRead(src);
-                        fs.CopyTo(es);
-                    }
+                    var entry = archive.CreateEntry("session/depth/" + stem + ".bin",
+                                                    SysCompressionLevel.Optimal);
+                    using var es = entry.Open();
+                    depthStream.Seek(depthInfo[i].Offset, SeekOrigin.Begin);
+                    CopyBytes(depthStream, es, depthInfo[i].Size, copyBuf);
                 }
+            }
+        }
+
+        static void CopyBytes(Stream src, Stream dst, int count, byte[] buf)
+        {
+            int remaining = count;
+            while (remaining > 0)
+            {
+                int read = src.Read(buf, 0, Math.Min(remaining, buf.Length));
+                if (read == 0) break;
+                dst.Write(buf, 0, read);
+                remaining -= read;
             }
         }
 

@@ -26,12 +26,13 @@ namespace SensorFlex.Recorder
         // Argument: human-readable error description.
         public event Action<string> RecordingFailedEvent;
 
+        // Invoked on the main thread when the max recording duration is reached and
+        // capture is automatically stopped and finalization begins.
+        public event Action RecordingLimitReachedEvent;
+
         // ── Inspector ──────────────────────────────────────────────────────
 
         [Header("Capture")]
-        [Min(1)]
-        [SerializeField] int m_TargetFPS = 30;
-
         [Tooltip("Optional session identifier override. Leave empty to auto-generate.")]
         [SerializeField] string m_SessionId = "";
 
@@ -55,6 +56,10 @@ namespace SensorFlex.Recorder
         [Min(0)]
         [SerializeField] int m_MaxPartSizeMb = 500;
 
+        [Tooltip("Maximum recording duration in seconds. 0 = unlimited.")]
+        [Min(0)]
+        [SerializeField] int m_MaxRecordingSeconds = 60;
+
         [Header("Controls")]
         [SerializeField] bool m_RecordOnStart;
 
@@ -68,24 +73,24 @@ namespace SensorFlex.Recorder
 
         // ── Exposed config (read by CaptureCoordinator) ────────────────────
 
-        internal int    TargetFPS         => Mathf.Max(1, m_TargetFPS);
-        internal string SessionId         => string.IsNullOrEmpty(m_SessionId)
-                                                ? (ActiveSessionId ?? Guid.NewGuid().ToString("N"))
-                                                : m_SessionId;
-        internal bool   CaptureColor      => m_CaptureColor;
-        internal bool   CaptureDepth      => m_CaptureDepth;
-        internal bool   CapturePose       => m_CapturePose;
-        internal bool   CaptureIntrinsics => m_CaptureIntrinsics;
-        internal string OutputDirectory   => Path.IsPathRooted(m_OutputDirectory)
-                                                ? m_OutputDirectory
-                                                : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
+        internal string SessionId            => string.IsNullOrEmpty(m_SessionId)
+                                                   ? (ActiveSessionId ?? Guid.NewGuid().ToString("N"))
+                                                   : m_SessionId;
+        internal bool   CaptureColor         => m_CaptureColor;
+        internal bool   CaptureDepth         => m_CaptureDepth;
+        internal bool   CapturePose          => m_CapturePose;
+        internal bool   CaptureIntrinsics    => m_CaptureIntrinsics;
+        internal int    MaxRecordingSeconds  => m_MaxRecordingSeconds;
+        internal string OutputDirectory      => Path.IsPathRooted(m_OutputDirectory)
+                                                   ? m_OutputDirectory
+                                                   : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
 
         // ── Private ────────────────────────────────────────────────────────
 
-        CaptureCoordinator      _coordinator;
-        Task<string[]>          _finalizationTask;
-        bool                    _recordOnStartPending;
-        float                   _recordOnStartDeadline;
+        CaptureCoordinator _coordinator;
+        Task<string[]>     _finalizationTask;
+        bool               _recordOnStartPending;
+        float              _recordOnStartDeadline;
 
         // ── Unity lifecycle ────────────────────────────────────────────────
 
@@ -117,6 +122,15 @@ namespace SensorFlex.Recorder
                     _recordOnStartPending = false;
                     Debug.LogWarning("[SF-Recorder] RecordOnStart timed out waiting for an active camera subsystem.");
                 }
+            }
+
+            // When the coordinator signals that max duration is reached, finalize.
+            if (IsRecording && _coordinator != null && _coordinator.LimitReached)
+            {
+                IsRecording = false;
+                Debug.Log("[SF-Recorder] Max recording duration reached. Starting finalization.");
+                BeginFinalization();
+                RecordingLimitReachedEvent?.Invoke();
             }
 
             // Poll async finalization result on the main thread.
@@ -177,7 +191,7 @@ namespace SensorFlex.Recorder
             }
 
             IsRecording = true;
-            Debug.Log($"[SF-Recorder] Recording started. Session='{ActiveSessionId}' TempDir='{tempDir}'");
+            Debug.Log($"[SF-Recorder] Recording started. Session='{ActiveSessionId}' TempDir='{tempDir}' MaxSeconds={m_MaxRecordingSeconds}");
             RecordingStartedEvent?.Invoke(tempDir);
         }
 
@@ -187,15 +201,24 @@ namespace SensorFlex.Recorder
                 return;
 
             IsRecording = false;
+            BeginFinalization();
+        }
 
+        // ── Private helpers ────────────────────────────────────────────────
+
+        // Pulls coordinator state, tears it down, and starts async finalization.
+        // Must only be called once per recording session (from StopRecording or limit path).
+        void BeginFinalization()
+        {
             if (_coordinator == null)
                 return;
 
             _coordinator.StopCapture();
 
-            string tempDir  = _coordinator.TempDir;
-            var    meta     = _coordinator.SessionMetadata;
-            var    records  = _coordinator.FrameRecords;
+            string             tempDir   = _coordinator.TempDir;
+            var                meta      = _coordinator.SessionMetadata;
+            var                records   = _coordinator.FrameRecords;
+            CaptureFolderWriter writer   = _coordinator.Writer;
 
             _coordinator.Dispose();
             _coordinator = null;
@@ -215,7 +238,7 @@ namespace SensorFlex.Recorder
                 : 0L;
 
             IsFinalizing      = true;
-            _finalizationTask = ArchiveFinalizer.FinalizeAsync(tempDir, outputDir, meta, records, maxBytes);
+            _finalizationTask = ArchiveFinalizer.FinalizeAsync(tempDir, outputDir, meta, records, writer, maxBytes);
             Debug.Log($"[SF-Recorder] Recording stopped ({records.Count} frames). Finalizing archive...");
         }
     }

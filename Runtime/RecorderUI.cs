@@ -52,9 +52,10 @@ public class RecorderUI : MonoBehaviour
             return;
         }
 
-        _recorder.RecordingStartedEvent   += OnStarted;
-        _recorder.RecordingFinalizedEvent += OnFinalized;
-        _recorder.RecordingFailedEvent    += OnFailed;
+        _recorder.RecordingStartedEvent      += OnStarted;
+        _recorder.RecordingFinalizedEvent    += OnFinalized;
+        _recorder.RecordingFailedEvent       += OnFailed;
+        _recorder.RecordingLimitReachedEvent += OnLimitReached;
     }
 
     void Start()
@@ -79,9 +80,10 @@ public class RecorderUI : MonoBehaviour
     void OnDestroy()
     {
         if (_recorder == null) return;
-        _recorder.RecordingStartedEvent   -= OnStarted;
-        _recorder.RecordingFinalizedEvent -= OnFinalized;
-        _recorder.RecordingFailedEvent    -= OnFailed;
+        _recorder.RecordingStartedEvent      -= OnStarted;
+        _recorder.RecordingFinalizedEvent    -= OnFinalized;
+        _recorder.RecordingFailedEvent       -= OnFailed;
+        _recorder.RecordingLimitReachedEvent -= OnLimitReached;
     }
 
     // ── Recorder events ────────────────────────────────────────────────
@@ -104,6 +106,12 @@ public class RecorderUI : MonoBehaviour
     void OnFailed(string err)
     {
         SetStatus($"Error: {err}", s_Recording, pulse: false);
+        RefreshRecordButton();
+    }
+
+    void OnLimitReached()
+    {
+        SetStatus("Limit reached — saving…", s_Finalizing, pulse: false);
         RefreshRecordButton();
     }
 
