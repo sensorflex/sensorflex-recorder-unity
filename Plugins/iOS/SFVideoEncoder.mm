@@ -189,14 +189,9 @@ int32_t SFDepthEncoder_AppendFrame(void *pF32, int32_t stride,
     if (ret != kCVReturnSuccess || !dstBuf) return 0;
 
     CVPixelBufferLockBaseAddress(dstBuf, 0);
-    __fp16 *dst     = (__fp16 *)CVPixelBufferGetBaseAddress(dstBuf);
-    float  *src     = (float *)pF32;
-    vImageConvert_PlanarFtoPlanar16F(src, dst,
-                                      (vImagePixelCount)width,
-                                      (vImagePixelCount)height,
-                                      (size_t)stride,
-                                      CVPixelBufferGetBytesPerRow(dstBuf),
-                                      kvImageNoFlags);
+    vImage_Buffer srcVI = { pF32, (vImagePixelCount)height, (vImagePixelCount)width, (size_t)stride };
+    vImage_Buffer dstVI = { CVPixelBufferGetBaseAddress(dstBuf), (vImagePixelCount)height, (vImagePixelCount)width, CVPixelBufferGetBytesPerRow(dstBuf) };
+    vImageConvert_PlanarFtoPlanar16F(&srcVI, &dstVI, kvImageNoFlags);
     CVPixelBufferUnlockBaseAddress(dstBuf, 0);
 
     CMTime time = CMTimeMake(timestampNs, 1000000000LL);
