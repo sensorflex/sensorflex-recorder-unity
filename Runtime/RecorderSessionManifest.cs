@@ -31,6 +31,13 @@ namespace SensorFlex.Recorder
         public bool   HasDepth;
         public int    DepthWidth, DepthHeight;
         public string DepthSensor;    // e.g. "arcore_environment_depth"
+        // Encoding path selected at capture time.
+        // "hevc"         — iOS native; session/rgb.mp4 (HEVC YCbCr420)
+        // "jpeg"         — managed software; session/rgb/NNNNNN.jpg
+        public string RgbEncoding;
+        // "hevc_float16" — iOS native; session/depth.mp4 (HEVC OneComponent16Half, metres)
+        // "raw_float32_le" — managed; session/depth/NNNNNN.bin (float32 LE metres)
+        public string DepthEncoding;
     }
 
     // One entry in the multi-part plan; FrameStart inclusive, FrameEnd exclusive.

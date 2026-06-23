@@ -4,7 +4,20 @@ using System.Text;
 
 namespace SensorFlex.Recorder
 {
-    // Builds session.json for the SFZ 1.0 format.
+    // Builds session.json for SFZ archives.
+    //
+    // Version "1.0" (legacy, non-iOS):
+    //   channels.rgb.format  = "jpeg"
+    //   channels.depth.format = "raw_float32_le"
+    //   per-frame rgb   = {"file":"rgb/NNNNNN.jpg"}
+    //   per-frame depth = {"file":"depth/NNNNNN.bin"}
+    //
+    // Version "1.1" (iOS native HEVC):
+    //   channels.rgb.format   = "hevc_mp4",   channels.rgb.file   = "rgb.mp4"
+    //   channels.depth.format = "hevc_float16", channels.depth.file = "depth.mp4"
+    //   per-frame rgb   = {"file":"rgb.mp4","frame_index":N}
+    //   per-frame depth = {"file":"depth.mp4","frame_index":N}
+    //
     // Single-file: pass parts = null → no "parts" key is emitted.
     // Multi-part:  pass the partition plan → "parts" array is written into part 0's JSON.
     internal static class SfzSerializer
@@ -12,15 +25,18 @@ namespace SensorFlex.Recorder
         public static byte[] BuildSessionJson(
             SfzSessionMetadata meta,
             List<SfzFrameRecord> frames,
-            SfzPartPlan[] parts)
+            SfzPartPlan[] parts,
+            bool isNativePath = false)
         {
+            string version = isNativePath ? "1.1" : "1.0";
+
             var sb = new StringBuilder(512 + frames.Count * 160);
             sb.Append("{\n");
 
             // ── Top-level scalars ────────────────────────────────────────────
-            AppendStr(sb, "version",        "1.0",                1, true);
-            AppendStr(sb, "session_id",     meta.SessionId,       1, true);
-            AppendStr(sb, "start_time_utc", meta.StartTimeUtc,    1, true);
+            AppendStr(sb, "version",        version,           1, true);
+            AppendStr(sb, "session_id",     meta.SessionId,    1, true);
+            AppendStr(sb, "start_time_utc", meta.StartTimeUtc, 1, true);
 
             // ── device ───────────────────────────────────────────────────────
             sb.Append(I(1)).Append("\"device\": {\n");
@@ -41,11 +57,9 @@ namespace SensorFlex.Recorder
                     sb.Append(I(3)).Append("\"contents\": [\n");
 
                     bool isFirstPart = p == 0;
-                    bool isLastContent = part.FrameEnd <= part.FrameStart;
 
                     if (isFirstPart)
                     {
-                        // Part 0 holds session.json
                         sb.Append(I(4)).Append("{ \"type\": \"session\" }");
                         if (part.FrameEnd > part.FrameStart) sb.Append(',');
                         sb.Append('\n');
@@ -84,7 +98,15 @@ namespace SensorFlex.Recorder
                 sb.Append(I(5)).Append("\"rgb\": {\n");
                 AppendInt(sb, "width",  meta.RgbWidth,  6, true);
                 AppendInt(sb, "height", meta.RgbHeight, 6, true);
-                AppendStr(sb, "format", "jpeg",         6, false);
+                if (isNativePath)
+                {
+                    AppendStr(sb, "format", "hevc_mp4", 6, true);
+                    AppendStr(sb, "file",   "rgb.mp4",  6, false);
+                }
+                else
+                {
+                    AppendStr(sb, "format", "jpeg", 6, false);
+                }
                 sb.Append(I(5)).Append('}');
                 if (rgbTrailing) sb.Append(',');
                 sb.Append('\n');
@@ -95,7 +117,15 @@ namespace SensorFlex.Recorder
                 sb.Append(I(5)).Append("\"depth\": {\n");
                 AppendInt(sb, "width",  meta.DepthWidth,  6, true);
                 AppendInt(sb, "height", meta.DepthHeight, 6, true);
-                AppendStr(sb, "format", "raw_float32_le", 6, true);
+                if (isNativePath)
+                {
+                    AppendStr(sb, "format", "hevc_float16", 6, true);
+                    AppendStr(sb, "file",   "depth.mp4",    6, true);
+                }
+                else
+                {
+                    AppendStr(sb, "format", "raw_float32_le", 6, true);
+                }
                 AppendStr(sb, "units",  "meters",         6, true);
                 AppendStr(sb, "sensor", meta.DepthSensor ?? "arcore_environment_depth", 6, true);
                 AppendDbl(sb, "invalid_value", 0.0,       6, false);
@@ -110,7 +140,7 @@ namespace SensorFlex.Recorder
             for (int i = 0; i < frames.Count; i++)
             {
                 var f = frames[i];
-                AppendFrameRecord(sb, f, 4);
+                AppendFrameRecord(sb, f, 4, isNativePath);
                 if (i < frames.Count - 1) sb.Append(',');
                 sb.Append('\n');
             }
@@ -125,7 +155,7 @@ namespace SensorFlex.Recorder
 
         // ── Frame record ─────────────────────────────────────────────────────
 
-        static void AppendFrameRecord(StringBuilder sb, SfzFrameRecord f, int indent)
+        static void AppendFrameRecord(StringBuilder sb, SfzFrameRecord f, int indent, bool isNativePath)
         {
             sb.Append(I(indent)).Append('{');
             sb.Append("\"timestamp_ns\":").Append(f.TimestampNs).Append(',');
@@ -158,14 +188,32 @@ namespace SensorFlex.Recorder
 
             if (f.HasColor)
             {
-                string file = "rgb/" + f.FrameIndex.ToString("D6") + ".jpg";
-                sb.Append(",\"rgb\":{\"file\":").Append('"').Append(file).Append("\"}");
+                if (isNativePath)
+                {
+                    sb.Append(",\"rgb\":{\"file\":\"rgb.mp4\",\"frame_index\":")
+                      .Append(f.FrameIndex)
+                      .Append('}');
+                }
+                else
+                {
+                    string file = "rgb/" + f.FrameIndex.ToString("D6") + ".jpg";
+                    sb.Append(",\"rgb\":{\"file\":\"").Append(file).Append("\"}");
+                }
             }
 
             if (f.HasDepth)
             {
-                string file = "depth/" + f.FrameIndex.ToString("D6") + ".bin";
-                sb.Append(",\"depth\":{\"file\":").Append('"').Append(file).Append("\"}");
+                if (isNativePath)
+                {
+                    sb.Append(",\"depth\":{\"file\":\"depth.mp4\",\"frame_index\":")
+                      .Append(f.FrameIndex)
+                      .Append('}');
+                }
+                else
+                {
+                    string file = "depth/" + f.FrameIndex.ToString("D6") + ".bin";
+                    sb.Append(",\"depth\":{\"file\":\"").Append(file).Append("\"}");
+                }
             }
 
             sb.Append('}');

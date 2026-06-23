@@ -7,13 +7,18 @@ using UnityEngine.Experimental.Rendering;
 
 namespace SensorFlex.Recorder
 {
-    // Two encoder threads convert raw RGBA frames to JPEG in parallel.
-    // A single writer thread drains encoded frames in frame-index order and appends
-    // them to binary stream files, eliminating per-frame file-create overhead.
+    // On non-iOS platforms:
+    //   Two encoder threads convert raw RGBA frames to JPEG in parallel.
+    //   A single writer thread drains encoded frames in frame-index order and appends
+    //   them to binary stream files, eliminating per-frame file-create overhead.
+    //   Stream format (rgb.stream and depth.stream):
+    //     [int32 dataSize][dataSize bytes payload]  repeated per frame in order.
+    //     dataSize == 0 means no data for that frame.
     //
-    // Stream format (rgb.stream and depth.stream):
-    //   [int32 dataSize][dataSize bytes payload]  repeated per frame in order.
-    //   dataSize == 0 means no data for that frame.
+    // On iOS (useNativeEncoder = true):
+    //   No encoder or writer threads are started.  RGB and depth are encoded to
+    //   RgbMp4Path / DepthMp4Path by NativeVideoEncoder (hardware HEVC).
+    //   WaitForFlush() delegates to NativeVideoEncoder.WaitForBothFinished().
     internal sealed class CaptureFolderWriter
     {
         public struct RawFrameJob
@@ -36,9 +41,13 @@ namespace SensorFlex.Recorder
         // ── Output paths ───────────────────────────────────────────────────
         public string RgbStreamPath   { get; }
         public string DepthStreamPath { get; }
+        public string RgbMp4Path      { get; }
+        public string DepthMp4Path    { get; }
 
-        // ── Threading ──────────────────────────────────────────────────────
+        // ── Threading (non-iOS only) ───────────────────────────────────────
         const int RawQueueCapacity = 16;
+
+        readonly bool _useNativeEncoder;
 
         BlockingCollection<RawFrameJob>        _rawQueue;
         ConcurrentDictionary<int, EncodedSlot> _encodedSlots;
@@ -49,15 +58,20 @@ namespace SensorFlex.Recorder
         BinaryWriter _rgbWriter;
         BinaryWriter _depthWriter;
 
-        public CaptureFolderWriter(string tempDir)
+        public CaptureFolderWriter(string tempDir, bool useNativeEncoder = false)
         {
+            _useNativeEncoder = useNativeEncoder;
             Directory.CreateDirectory(tempDir);
             RgbStreamPath   = Path.Combine(tempDir, "rgb.stream");
             DepthStreamPath = Path.Combine(tempDir, "depth.stream");
+            RgbMp4Path      = Path.Combine(tempDir, "rgb.mp4");
+            DepthMp4Path    = Path.Combine(tempDir, "depth.mp4");
         }
 
         public void Start()
         {
+            if (_useNativeEncoder) return;
+
             _rawQueue     = new BlockingCollection<RawFrameJob>(RawQueueCapacity);
             _encodedSlots = new ConcurrentDictionary<int, EncodedSlot>();
             _stopWriter   = false;
@@ -76,16 +90,31 @@ namespace SensorFlex.Recorder
         }
 
         // Called on main thread. Returns false only if raw queue is full (capacity 16).
-        // With two encoder threads at camera FPS this should never happen in practice.
-        public bool TryEnqueue(RawFrameJob job) => _rawQueue?.TryAdd(job) ?? false;
+        // No-op on iOS (returns true immediately).
+        public bool TryEnqueue(RawFrameJob job)
+        {
+            if (_useNativeEncoder) return true;
+            return _rawQueue?.TryAdd(job) ?? false;
+        }
 
         // Signal encoders that no more frames are coming. Returns immediately;
         // call WaitForFlush() on a background thread to wait for all writes to complete.
-        public void CompleteAdding() => _rawQueue?.CompleteAdding();
+        public void CompleteAdding()
+        {
+            if (_useNativeEncoder) return;
+            _rawQueue?.CompleteAdding();
+        }
 
         // Blocks until all frames are encoded and flushed to disk. Call off main thread.
+        // On iOS, waits for both native HEVC sessions to finalize their MP4 files.
         public void WaitForFlush(int timeoutMs = 30_000)
         {
+            if (_useNativeEncoder)
+            {
+                NativeVideoEncoder.WaitForBothFinished(timeoutMs);
+                return;
+            }
+
             _encoderThread1?.Join(timeoutMs);
             _encoderThread2?.Join(timeoutMs);
             _stopWriter = true;
@@ -102,7 +131,7 @@ namespace SensorFlex.Recorder
             _rawQueue = null;
         }
 
-        // ── Encoder threads ────────────────────────────────────────────────
+        // ── Encoder threads (non-iOS) ──────────────────────────────────────
 
         void EncoderLoop()
         {
@@ -130,7 +159,7 @@ namespace SensorFlex.Recorder
             }
         }
 
-        // ── Writer thread ──────────────────────────────────────────────────
+        // ── Writer thread (non-iOS) ────────────────────────────────────────
 
         void WriterLoop()
         {
@@ -138,7 +167,6 @@ namespace SensorFlex.Recorder
 
             while (true)
             {
-                // Drain all consecutive ready frames from the reorder map.
                 bool wrote = false;
                 while (_encodedSlots.TryRemove(nextWrite, out var slot))
                 {

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.XR.CoreUtils;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
@@ -14,6 +15,11 @@ namespace SensorFlex.Recorder
     // Threading: all public methods are called from the main thread.
     // CaptureFolderWriter's encoder/writer threads only see value-type snapshots
     // that are fully copied before being enqueued.
+    //
+    // On iOS the color and depth paths are replaced by hardware HEVC encoding via
+    // NativeVideoEncoder (P/Invoke into SFVideoEncoder.mm).  CaptureFolderWriter
+    // runs as a no-op on those platforms; only pose/intrinsics metadata is routed
+    // through it as before.
     internal sealed class CaptureCoordinator : IDisposable
     {
         // ── Public state ───────────────────────────────────────────────────
@@ -60,6 +66,17 @@ namespace SensorFlex.Recorder
         bool _warnedMissingIntrinsics;
         bool _warnedMissingDepth;
 
+#if UNITY_IOS && !UNITY_EDITOR
+        // Native HEVC encoder state
+        bool _nativeRgbStarted;
+        bool _nativeDepthStarted;
+        bool _warnedRgbNotReady;
+        bool _warnedDepthNotReady;
+#endif
+
+        // Whether this session uses the native HEVC path
+        readonly bool _useNativeEncoder;
+
         const EnvironmentDepthMode TargetDepthMode = EnvironmentDepthMode.Medium;
 
         // ── Constructor ────────────────────────────────────────────────────
@@ -68,7 +85,14 @@ namespace SensorFlex.Recorder
         {
             _config = config;
             TempDir = tempDir;
-            Writer  = new CaptureFolderWriter(tempDir);
+
+#if UNITY_IOS && !UNITY_EDITOR
+            _useNativeEncoder = true;
+#else
+            _useNativeEncoder = false;
+#endif
+
+            Writer = new CaptureFolderWriter(tempDir, _useNativeEncoder);
         }
 
         // ── Lifecycle ──────────────────────────────────────────────────────
@@ -131,11 +155,18 @@ namespace SensorFlex.Recorder
                                          : 0L;
             FrameRecords.Clear();
 
+#if UNITY_IOS && !UNITY_EDITOR
+            _nativeRgbStarted   = false;
+            _nativeDepthStarted = false;
+            _warnedRgbNotReady  = false;
+            _warnedDepthNotReady = false;
+#endif
+
             Writer.Start();
             _cameraManager.frameReceived += OnCameraFrameReceived;
             _isCapturing = true;
 
-            Debug.Log($"[SF-Recorder] Capture started. TempDir='{TempDir}' Depth={_captureDepthEnabled} MaxSeconds={_config.MaxRecordingSeconds}");
+            Debug.Log($"[SF-Recorder] Capture started. TempDir='{TempDir}' Depth={_captureDepthEnabled} NativeEncoder={_useNativeEncoder} MaxSeconds={_config.MaxRecordingSeconds}");
             return true;
         }
 
@@ -148,6 +179,13 @@ namespace SensorFlex.Recorder
 
             if (_cameraManager != null)
                 _cameraManager.frameReceived -= OnCameraFrameReceived;
+
+#if UNITY_IOS && !UNITY_EDITOR
+            // Signal native encoders to finalize their MP4 files.
+            // WaitForBothFinished() is called inside CaptureFolderWriter.WaitForFlush().
+            if (_nativeRgbStarted)   NativeVideoEncoder.FinishRgbSession();
+            if (_nativeDepthStarted) NativeVideoEncoder.FinishDepthSession();
+#endif
 
             Writer.CompleteAdding();
 
@@ -165,7 +203,9 @@ namespace SensorFlex.Recorder
                 HasDepth     = _hasFirstDepthDims,
                 DepthWidth   = _firstDepthW,
                 DepthHeight  = _firstDepthH,
-                DepthSensor  = _depthSensor
+                DepthSensor  = _depthSensor,
+                RgbEncoding  = _useNativeEncoder ? "hevc" : "jpeg",
+                DepthEncoding = _useNativeEncoder ? "hevc_float16" : "raw_float32_le",
             };
 
             Debug.Log($"[SF-Recorder] Capture stopped. Frames={FrameRecords.Count} ActualFPS={SessionMetadata.Fps}");
@@ -194,12 +234,25 @@ namespace SensorFlex.Recorder
                 return;
             }
 
-            // ── Colour ────────────────────────────────────────────────────
+            bool hasColor = false;
+            bool hasDepth = false;
+
+#if UNITY_IOS && !UNITY_EDITOR
+            // ── iOS: hardware HEVC encoding, no managed pixel data ─────────
+
+            if (_config.CaptureColor)
+                hasColor = AcquireAndEncodeColorNative(timestampNs);
+
+            if (_captureDepthEnabled)
+                hasDepth = AcquireAndEncodeDepthNative(timestampNs);
+
+#else
+            // ── Non-iOS: existing RGBA → JPEG → writer-thread path ─────────
+
             byte[] rawRgba = null;
             byte[] jpg     = null;
             uint   rgbaW   = 0, rgbaH = 0;
             int    colorW  = 0, colorH = 0;
-            bool   hasColor = false;
 
             if (_config.CaptureColor)
             {
@@ -219,10 +272,8 @@ namespace SensorFlex.Recorder
                 }
             }
 
-            // ── Depth ─────────────────────────────────────────────────────
             byte[] depthF32 = null;
             int    depthW   = 0, depthH = 0;
-            bool   hasDepth = false;
 
             if (_captureDepthEnabled)
             {
@@ -236,6 +287,7 @@ namespace SensorFlex.Recorder
                     _hasFirstDepthDims = true;
                 }
             }
+#endif
 
             // ── Pose ──────────────────────────────────────────────────────
             Vector3    position = Vector3.zero;
@@ -258,17 +310,23 @@ namespace SensorFlex.Recorder
                     fx = _cachedFx; fy = _cachedFy; cx = _cachedCx; cy = _cachedCy;
                     hasIntrinsics = true;
                 }
-                else if (TryGetIntrinsics(colorW, colorH, out float oFx, out float oFy, out float oCx, out float oCy))
+                else
                 {
-                    fx = oFx; fy = oFy; cx = oCx; cy = oCy;
-                    _cachedFx = fx; _cachedFy = fy; _cachedCx = cx; _cachedCy = cy;
-                    _hasValidIntrinsics = true;
-                    hasIntrinsics       = true;
-                }
-                else if (!_warnedMissingIntrinsics)
-                {
-                    Debug.LogWarning("[SF-Recorder] No camera intrinsics available yet; frame will have no intrinsics.");
-                    _warnedMissingIntrinsics = true;
+#if UNITY_IOS && !UNITY_EDITOR
+                    int colorW = _firstColorW, colorH = _firstColorH;
+#endif
+                    if (TryGetIntrinsics(colorW, colorH, out float oFx, out float oFy, out float oCx, out float oCy))
+                    {
+                        fx = oFx; fy = oFy; cx = oCx; cy = oCy;
+                        _cachedFx = fx; _cachedFy = fy; _cachedCx = cx; _cachedCy = cy;
+                        _hasValidIntrinsics = true;
+                        hasIntrinsics       = true;
+                    }
+                    else if (!_warnedMissingIntrinsics)
+                    {
+                        Debug.LogWarning("[SF-Recorder] No camera intrinsics available yet; frame will have no intrinsics.");
+                        _warnedMissingIntrinsics = true;
+                    }
                 }
             }
 
@@ -285,6 +343,8 @@ namespace SensorFlex.Recorder
                 HasDepth = hasDepth
             });
 
+#if !(UNITY_IOS && !UNITY_EDITOR)
+            // Non-iOS: enqueue binary payload for the writer thread.
             var job = new CaptureFolderWriter.RawFrameJob
             {
                 FrameIndex = _frameIndex,
@@ -300,11 +360,103 @@ namespace SensorFlex.Recorder
                 Debug.LogWarning($"[SF-Recorder] Frame {_frameIndex} dropped — raw queue is full.");
                 _warnedDropped = true;
             }
+#endif
 
             _frameIndex++;
         }
 
-        // ── Color acquisition ──────────────────────────────────────────────
+        // ── iOS native capture helpers ─────────────────────────────────────
+
+#if UNITY_IOS && !UNITY_EDITOR
+        unsafe bool AcquireAndEncodeColorNative(long timestampNs)
+        {
+            if (!_cameraManager.TryAcquireLatestCpuImage(out var cpuImage))
+                return false;
+
+            try
+            {
+                if (!_nativeRgbStarted)
+                {
+                    NativeVideoEncoder.StartRgbSession(Writer.RgbMp4Path, cpuImage.width, cpuImage.height);
+                    _firstColorW = cpuImage.width; _firstColorH = cpuImage.height;
+                    _hasFirstColorDims = true;
+                    _nativeRgbStarted  = true;
+                }
+
+                var planeY    = cpuImage.GetPlane(0);
+                var planeCbCr = cpuImage.GetPlane(1);
+                void* pY    = NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(planeY.data);
+                void* pCbCr = NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(planeCbCr.data);
+
+                bool appended = NativeVideoEncoder.AppendRgbFrame(
+                    (IntPtr)pY,    planeY.rowStride,
+                    (IntPtr)pCbCr, planeCbCr.rowStride,
+                    cpuImage.width, cpuImage.height, timestampNs);
+
+                if (!appended && !_warnedRgbNotReady)
+                {
+                    Debug.LogWarning("[SF-Recorder] RGB encoder not ready — frame dropped.");
+                    _warnedRgbNotReady = true;
+                }
+
+                return appended;
+            }
+            finally
+            {
+                cpuImage.Dispose();
+            }
+        }
+
+        unsafe bool AcquireAndEncodeDepthNative(long timestampNs)
+        {
+            if (!_occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImage))
+            {
+                if (!_warnedMissingDepth)
+                {
+                    Debug.LogWarning(
+                        $"[SF-Recorder] Depth unavailable. " +
+                        $"requested={_occlusionManager.requestedEnvironmentDepthMode} " +
+                        $"current={_occlusionManager.currentEnvironmentDepthMode}");
+                    _warnedMissingDepth = true;
+                }
+                return false;
+            }
+
+            _warnedMissingDepth = false;
+
+            try
+            {
+                if (!_nativeDepthStarted)
+                {
+                    NativeVideoEncoder.StartDepthSession(Writer.DepthMp4Path, depthImage.width, depthImage.height);
+                    _firstDepthW = depthImage.width; _firstDepthH = depthImage.height;
+                    _hasFirstDepthDims  = true;
+                    _nativeDepthStarted = true;
+                }
+
+                var plane  = depthImage.GetPlane(0);
+                void* pF32 = NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(plane.data);
+
+                bool appended = NativeVideoEncoder.AppendDepthFrame(
+                    (IntPtr)pF32, plane.rowStride,
+                    depthImage.width, depthImage.height, timestampNs);
+
+                if (!appended && !_warnedDepthNotReady)
+                {
+                    Debug.LogWarning("[SF-Recorder] Depth encoder not ready — frame dropped.");
+                    _warnedDepthNotReady = true;
+                }
+
+                return appended;
+            }
+            finally
+            {
+                depthImage.Dispose();
+            }
+        }
+#endif
+
+        // ── Non-iOS color acquisition ──────────────────────────────────────
 
         (byte[] rawRgba, byte[] jpg, int w, int h) TryAcquireColorFrame(ARCameraFrameEventArgs args)
         {
@@ -375,7 +527,7 @@ namespace SensorFlex.Recorder
             }
         }
 
-        // ── Depth acquisition ──────────────────────────────────────────────
+        // ── Non-iOS depth acquisition ──────────────────────────────────────
 
         (byte[] depthF32, int w, int h) TryAcquireDepthFloat32()
         {

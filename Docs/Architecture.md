@@ -3,188 +3,163 @@
 `com.sensorflex.recorder.unity` is the recording-side counterpart to `com.sensorflex.player.unity`.
 
 The recorder captures ARFoundation session data in real time, persists binary frame assets to a
-temporary folder on device during recording, and packages the result into one or more SFZ 1.0
-archives after recording stops.
-
-The output format is exactly the SFZ 1.0 specification consumed by the player. No conversion step
-is required to replay a recorded archive.
+temporary folder on device during recording, and packages the result into one or more SFZ archives
+after recording stops.
 
 ## Goals
 
 - Record ARFoundation data in real time without stalling frame delivery.
-- Produce SFZ 1.0 archives that the player can replay directly.
-- Keep the live capture path as simple as possible: write binary files, accumulate lightweight metadata.
+- On iOS, use hardware HEVC encoding (VideoToolbox) for zero managed allocation on the hot path.
+- Produce SFZ archives readable by the player and the Python data pipeline.
+- Keep the live capture path as simple as possible.
 - Treat archive creation as a post-recording finalization step.
-- Keep scene-facing APIs small.
 
 ## Non-Goals
 
 - Compressing or zipping entries in the hot capture path.
 - Per-frame JSON files on disk.
 - Generalized media pipelines for unrelated formats.
-- Capturing every ARFoundation subsystem on day one.
 
-## System Overview
+## System Overview — iOS HEVC path (v1.1)
 
 ```
  ┌─────────────────────────────────────────────────────────┐
  │  Scene                                                   │
- │                                                          │
  │  XROrigin ──── ARSensorFlexRecorder                      │
  │    └─ Camera                                             │
  │         ├─ ARCameraManager                               │
  │         └─ AROcclusionManager                            │
  └───────────────┬─────────────────────┬───────────────────┘
                  │ frameReceived        │ depth CPU image
-                 │                      │
- ┌───────────────▼──────────────────────▼───────────────────┐
- │  MAIN THREAD                                              │
- │                                                           │
- │  CaptureCoordinator.OnCameraFrameReceived()               │
- │                                                           │
- │   color  ──► encode JPEG  (XRCpuImage › Texture2D › JPG) │
- │   depth  ──► float32 m    (uint16 mm ÷ 1000, or copy)    │
- │   pose   ──► position + quaternion  (Camera.transform)    │
- │   intrin ──► native › FOV estimate › cached fallback      │
- │                                          │                │
- │   SfzFrameRecord ────────────────────────┼──► List<>      │
- │   (per-frame metadata, ~64 bytes)        │    in memory   │
- │                                          │                │
- │   FrameWriteJob (jpg bytes, depth bytes) │                │
- │     │                                    │                │
- └─────┼────────────────────────────────────┼────────────────┘
-       │  BlockingCollection[120]            │
-       ▼                                     │
- ┌─────────────────────────────────┐         │
- │  BACKGROUND THREAD              │         │
- │  CaptureFolderWriter            │         │
- │                                 │         │
- │  temp/{id}/rgb/000000.jpg       │         │
- │  temp/{id}/rgb/000001.jpg  …    │         │
- │  temp/{id}/depth/000000.bin     │         │
- │  temp/{id}/depth/000001.bin  …  │         │
- └─────────────────────────────────┘         │
-        temp folder on disk                  │
-              │    ┌───────────────────────── ┘
-              │    │  List<SfzFrameRecord>
-              │    │  SfzSessionMetadata
-              ▼    ▼
+                 ▼                      ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │  MAIN THREAD                                             │
+ │  CaptureCoordinator.OnCameraFrameReceived()              │
+ │                                                          │
+ │  color ──► NativeVideoEncoder.AppendRgbFrame()           │
+ │            (IntPtr to Y+CbCr planes; ~4 MB memcpy)       │
+ │  depth ──► NativeVideoEncoder.AppendDepthFrame()         │
+ │            (IntPtr to float32 plane; vDSP → float16)     │
+ │  pose  ──► position + quaternion (Camera.transform)      │
+ │  intrin ──► native › FOV estimate › cached fallback      │
+ │                                                          │
+ │  SfzFrameRecord ──────────────────────────────► List<>   │
+ └──────────────────────────────────────────────────────────┘
+                    │ P/Invoke (fast, < 0.1 ms)
+                    ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │  NATIVE (VideoToolbox hardware, dedicated HW block)      │
+ │  SFVideoEncoder.mm                                       │
+ │                                                          │
+ │  RGB encoder:                                            │
+ │    CVPixelBufferCreateWithPlanarBytes (owns copy)        │
+ │    → AVAssetWriterInputPixelBufferAdaptor                │
+ │    → HEVC YCbCr420 → rgb.mp4                            │
+ │                                                          │
+ │  Depth encoder:                                          │
+ │    vImageConvert_PlanarFtoPlanar16F (float32 → float16)  │
+ │    → CVPixelBufferPool (OneComponent16Half)              │
+ │    → AVAssetWriterInputPixelBufferAdaptor                │
+ │    → HEVC Monochrome → depth.mp4                        │
+ └────────────────────┬─────────────────────────────────────┘
+                      │ (on finish)
+             temp/{id}/rgb.mp4
+             temp/{id}/depth.mp4
+                      │
+                      │  List<SfzFrameRecord>
+                      │  SfzSessionMetadata
+                      ▼
  ┌────────────────────────────────────────────────────────────┐
- │  TASK THREAD                                               │
- │  ArchiveFinalizer                                          │
+ │  TASK THREAD — ArchiveFinalizer                            │
  │                                                            │
- │  SfzSerializer                                             │
- │    └─ session.json  (all frame records inline in data[])   │
+ │  NativeVideoEncoder.WaitForBothFinished()                  │
+ │  SfzSerializer → session.json  (version "1.1")             │
  │                                                            │
- │  greedy bin-pack ─► SfzPartPlan[]                          │
- │                                                            │
- │  ┌─ single file ──────────────────────────────────────┐   │
- │  │  {id}.sfz                                          │   │
- │  │  └─ session/ ─ session.json  [DEFLATE]             │   │
- │  │              ─ rgb/NNNNNN.jpg   [STORED]           │   │
- │  │              ─ depth/NNNNNN.bin [DEFLATE]          │   │
- │  └────────────────────────────────────────────────────┘   │
- │  ─ or ─                                                    │
- │  ┌─ multi-part ───────────────────────────────────────┐   │
- │  │  {id}-00000-of-N.sfz  session.json + [0,   k)      │   │
- │  │  {id}-00001-of-N.sfz               + [k,  2k)      │   │
- │  │  …                                                  │   │
- │  └────────────────────────────────────────────────────┘   │
- │                                                            │
- │  delete temp folder                                        │
- └───────────────────────────────┬────────────────────────────┘
-                                 │
-                  ┌──────────────▼──────────────────┐
-                  │  MAIN THREAD  (Update() poll)    │
-                  │  RecordingFinalizedEvent(paths)  │
-                  └─────────────────────────────────┘
+ │  ┌─ {id}.sfz ──────────────────────────────────────────┐  │
+ │  │  session/session.json  [DEFLATE]                     │  │
+ │  │  session/rgb.mp4       [STORED]                      │  │
+ │  │  session/depth.mp4     [STORED]                      │  │
+ │  └──────────────────────────────────────────────────────┘  │
+ └────────────────────────────────────────────────────────────┘
 ```
 
-## High-Level Flow
+## System Overview — non-iOS / legacy path (v1.0)
 
 ```
-Start Recording
-    │
-    ├─ CaptureCoordinator subscribes to ARCameraManager.frameReceived
-    │
-    ▼ (each AR frame, main thread)
-    ├─ Encode color image → jpg bytes
-    ├─ Acquire depth, convert to float32 metres → raw bytes
-    ├─ Extract camera pose (position + quaternion)
-    ├─ Extract camera intrinsics (fx, fy, cx, cy)
-    ├─ Append SfzFrameRecord to in-memory list
-    └─ Enqueue FrameWriteJob ──► CaptureFolderWriter (background thread)
-                                      │
-                                      └─ writes  temp/{sessionId}/rgb/NNNNNN.jpg
-                                                 temp/{sessionId}/depth/NNNNNN.bin
-
-Stop Recording
-    │
-    ├─ Join writer thread (flush pending writes)
-    ├─ Assemble SfzSessionMetadata from observed dimensions
-    └─ Launch ArchiveFinalizer.FinalizeAsync (background Task)
-                │
-                ├─ Build session.json from in-memory frame records
-                ├─ Plan partition (single file or multi-part)
-                ├─ Write .sfz archive(s)
-                └─ Delete temp folder
-
-Main thread Update() polls Task completion → fire RecordingFinalizedEvent
+ MAIN THREAD
+   color ──► XRCpuImage.Convert(RGBA32) ──► NativeArray.ToArray()
+   depth ──► float32 bytes
+   both  ──► CaptureFolderWriter.TryEnqueue(RawFrameJob)
+                     │  BlockingCollection[16]
+                     ▼
+   ENCODER THREADS (×2): RGBA → JPEG (software, ImageConversion)
+   WRITER THREAD:  rgb.stream + depth.stream  (length-prefixed binary)
+                     │
+   TASK THREAD: scan streams → per-frame .jpg + .bin → SFZ v1.0
 ```
 
-## Output Format: SFZ 1.0
+## High-Level Flow (iOS)
 
-The recorder targets SFZ 1.0 as defined by `com.sensorflex.player.unity/Docs/SensorFlexFormat.md`.
+```
+StartRecording
+  CaptureCoordinator.StartCapture()
+    └─ Subscribes to ARCameraManager.frameReceived
 
-### Archive layout (single-file)
+Each AR frame (main thread):
+  ├─ First frame: NativeVideoEncoder.StartRgbSession(mp4Path, w, h)
+  │                NativeVideoEncoder.StartDepthSession(mp4Path, w, h)
+  ├─ NativeVideoEncoder.AppendRgbFrame(pY, strideY, pCbCr, strideCbCr, ...)
+  ├─ NativeVideoEncoder.AppendDepthFrame(pF32, stride, ...)
+  └─ Append SfzFrameRecord to in-memory list
+
+StopRecording
+  ├─ NativeVideoEncoder.FinishRgbSession()   → async seal
+  ├─ NativeVideoEncoder.FinishDepthSession() → async seal
+  └─ Launch ArchiveFinalizer.FinalizeAsync (background Task)
+        ├─ NativeVideoEncoder.WaitForBothFinished(30s)
+        ├─ Build session.json (v1.1)
+        ├─ Write .sfz: session.json + rgb.mp4 + depth.mp4
+        └─ Delete temp folder
+```
+
+## Output Format: SFZ
+
+### v1.1 (iOS HEVC) — archive layout
 
 ```
 session/
-  session.json          ← all metadata + full frame record array
+  session.json          ← version "1.1", channel format "hevc_mp4" / "hevc_float16"
+  rgb.mp4               ← HEVC YCbCr420, all frames
+  depth.mp4             ← HEVC OneComponent16Half (float16 metres), all frames
+```
+
+### v1.0 (legacy) — archive layout
+
+```
+session/
+  session.json          ← version "1.0", channel format "jpeg" / "raw_float32_le"
   rgb/
-    000000.jpg
-    000001.jpg
-    ...
-  depth/                ← present only when depth was captured
-    000000.bin
-    000001.bin
-    ...
+    000000.jpg … NNNNNN.jpg
+  depth/
+    000000.bin … NNNNNN.bin  (float32 LE metres)
 ```
 
-### Archive layout (multi-part)
-
-When `MaxPartSizeMb > 0` and the total session exceeds the limit, output is split:
-
-```
-{sessionId}-00000-of-NNNNN.sfz   session.json + first frame chunk
-{sessionId}-00001-of-NNNNN.sfz   next frame chunk
-...
-```
-
-`session.json` always lives in part 0. It contains a `parts` manifest that maps each frame
-range to its part file. All parts must be present before the player can load the session.
-
-### session.json schema
+### session.json — v1.1 example
 
 ```json
 {
-  "version": "1.0",
+  "version": "1.1",
   "session_id": "abc123",
   "start_time_utc": "2026-05-30T10:30:00.000Z",
-  "device": {
-    "model": "Pixel 7 Pro",
-    "os": "Android OS 13",
-    "ar_framework": "ARCore"
-  },
-  "parts": [ ... ],
+  "device": { "model": "iPhone 16 Pro", "os": "iOS 18.0", "ar_framework": "ARKit" },
   "tracks": {
     "frames": {
       "metadata": {
         "fps": 30,
         "channels": {
-          "rgb":   { "width": 1920, "height": 1440, "format": "jpeg" },
-          "depth": { "width": 256,  "height": 192,  "format": "raw_float32_le",
-                     "units": "meters", "sensor": "arcore_environment_depth", "invalid_value": 0.0 }
+          "rgb":   { "width": 1920, "height": 1440, "format": "hevc_mp4",    "file": "rgb.mp4" },
+          "depth": { "width": 256,  "height": 192,  "format": "hevc_float16","file": "depth.mp4",
+                     "units": "meters", "sensor": "arkit_lidar", "invalid_value": 0.0 }
         }
       },
       "data": [
@@ -194,205 +169,144 @@ range to its part file. All parts must be present before the player can load the
             "pose": { "position": [1.69, 4.42, -1.62], "rotation": [0.12, 0.34, 0.56, 0.75] },
             "intrinsics": { "fx": 1425.3, "fy": 1425.3, "cx": 954.9, "cy": 725.4 }
           },
-          "rgb":   { "file": "rgb/000000.jpg" },
-          "depth": { "file": "depth/000000.bin" }
-        },
-        ...
+          "rgb":   { "file": "rgb.mp4",   "frame_index": 0 },
+          "depth": { "file": "depth.mp4", "frame_index": 0 }
+        }
       ]
     }
   }
 }
 ```
 
-All per-frame metadata (pose, intrinsics, timestamps, file references) is embedded inline in the
-`tracks.frames.data` array. There are no per-frame JSON files on disk.
-
 ### Depth encoding
 
-Depth is stored as raw IEEE 754 float32, little-endian, row-major, in metres.
+**v1.1 (hevc_float16):** ARKit delivers depth as `kCVPixelFormatType_DepthFloat32` (metres).
+The native plugin converts float32 → float16 via `vImageConvert_PlanarFtoPlanar16F` into a
+`kCVPixelFormatType_OneComponent16Half` CVPixelBuffer, then encodes with HEVC Monochrome.
+On decode, the uint16 luma bit pattern is reinterpreted as IEEE 754 float16 to recover metres.
 
-- ARCore (`TryAcquireEnvironmentDepthCpuImage` → uint16 mm): converted to float32 metres at
-  capture time using integer division by 1000.
-- ARKit (`XRCpuImage` with 4-byte pixel stride, already float32 metres): copied directly.
-
-Invalid/no-return pixels are represented as `0.0`.
-
-### Coordinate system
-
-Follows the Unity world-space convention (left-handed, +Y up, +Z forward, metres). Pose
-`position` and `rotation` are read directly from `Camera.transform.position` and
-`Camera.transform.rotation` and written as-is.
+**v1.0 (raw_float32_le):** ARKit depth is copied directly (float32 metres, row-major). ARCore
+uint16 mm depth is converted to float32 metres at capture time.
 
 ### Zip compression per entry type
 
-| Entry              | Method     | Reason                                      |
-|--------------------|------------|---------------------------------------------|
-| `session.json`     | DEFLATE    | Text compresses well                        |
-| `rgb/NNNNNN.jpg`   | STORED     | JPEG is already compressed                  |
-| `depth/NNNNNN.bin` | DEFLATE    | Float32 depth compresses significantly      |
+| Entry              | Method     | Reason                                       |
+|--------------------|------------|----------------------------------------------|
+| `session.json`     | DEFLATE    | Text compresses well                         |
+| `rgb.mp4`          | STORED     | HEVC is already compressed                   |
+| `depth.mp4`        | STORED     | HEVC is already compressed                   |
+| `rgb/NNNNNN.jpg`   | STORED     | JPEG is already compressed (legacy)          |
+| `depth/NNNNNN.bin` | DEFLATE    | Float32 compresses significantly (legacy)    |
 
 ## Runtime Modules
 
 ### `ARSensorFlexRecorder`
 
-Scene-facing MonoBehaviour attached to `XROrigin`. Owns the recording lifecycle.
-
-Responsibilities:
-- Expose all configuration through Inspector fields.
-- Validate subsystem availability before starting.
-- Coordinate `CaptureCoordinator` and `ArchiveFinalizer`.
-- Poll the finalization `Task` in `Update()` and fire events on the main thread.
-
-Inspector fields:
-
-| Field             | Default               | Description                                    |
-|-------------------|-----------------------|------------------------------------------------|
-| TargetFPS         | 30                    | Nominal capture rate written into session.json |
-| SessionId         | _(auto UUID)_         | Override to use a fixed session identifier     |
-| CaptureColor      | true                  | Write RGB frames                               |
-| CaptureDepth      | true                  | Write depth frames when available              |
-| CapturePose       | true                  | Record camera pose per frame                   |
-| CaptureIntrinsics | true                  | Record intrinsics per frame                    |
-| OutputDirectory   | SensorFlexRecordings  | Relative to persistentDataPath, or absolute    |
-| MaxPartSizeMb     | 500                   | 0 = single file; > 0 = split at this limit     |
-| RecordOnStart     | false                 | Auto-start once the camera subsystem is ready  |
-
-Events:
-
-| Event                    | Argument         | When fired                                  |
-|--------------------------|------------------|---------------------------------------------|
-| `RecordingStartedEvent`  | `string tempDir` | Immediately after capture begins            |
-| `RecordingFinalizedEvent`| `string[] paths` | On main thread when .sfz files are written  |
-| `RecordingFailedEvent`   | `string error`   | On start failure or finalization exception  |
+Scene-facing MonoBehaviour attached to `XROrigin`. Unchanged from v1.0; all
+iOS/non-iOS branching happens below this level.
 
 ### `CaptureCoordinator`
 
-Internal class; one instance per recording session.
+Owns the per-frame callback. On iOS (`#if UNITY_IOS && !UNITY_EDITOR`):
+- Accesses `XRCpuImage.GetPlane()` NativeArrays via `NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr`
+- Passes raw plane pointers to `NativeVideoEncoder`; disposes `XRCpuImage` immediately after
+- Never allocates RGBA or depth byte arrays on the hot path
 
-Responsibilities:
-- Locate `ARCameraManager` and `AROcclusionManager` from the `XROrigin` camera.
-- Subscribe to / unsubscribe from `ARCameraManager.frameReceived`.
-- Encode each color frame to JPEG on the main thread (CPU image path preferred; texture blit fallback).
-- Convert depth to float32 metres on the main thread.
-- Accumulate `List<SfzFrameRecord>` in memory.
-- Route binary data to `CaptureFolderWriter`.
-- Expose `SessionMetadata` and `FrameRecords` after `StopCapture()`.
-
-Frame record accumulation is the reason per-frame JSON files are not needed: the coordinator
-maintains the full metadata list in memory and hands it off to the finalizer in one shot.
+On non-iOS: unchanged RGBA→JPEG + float32 path.
 
 ### `CaptureFolderWriter`
 
-Background-thread disk writer.
+Accepts `bool useNativeEncoder` in its constructor.
 
-Responsibilities:
-- Create `rgb/` and `depth/` subdirectories inside the temp folder.
-- Accept `FrameWriteJob` items from a bounded `BlockingCollection<>` (capacity 120).
-- Write `rgb/NNNNNN.jpg` and `depth/NNNNNN.bin` on a dedicated worker thread.
-- When the queue is full, the producer drops the frame and logs a warning rather than blocking
-  the main thread.
-- On `Stop()`, mark the queue complete and `Join` the thread with a 10-second timeout to flush
-  all pending writes.
+When true (iOS):
+- No encoder or writer threads are started
+- `TryEnqueue()` / `CompleteAdding()` are no-ops
+- `WaitForFlush()` delegates to `NativeVideoEncoder.WaitForBothFinished()`
+- Exposes `RgbMp4Path` / `DepthMp4Path` for the finalizer
+
+When false (non-iOS): unchanged thread model.
+
+### `NativeVideoEncoder`
+
+Static C# class. On iOS: P/Invoke bridge into `SFVideoEncoder.mm`.
+On all other platforms: empty stubs (no-ops).
+
+Key methods:
+- `StartRgbSession(path, w, h)` / `StartDepthSession(path, w, h)` — lazy, called on first frame
+- `AppendRgbFrame(pY, strideY, pCbCr, strideCbCr, w, h, tsNs)` — per-frame, main thread
+- `AppendDepthFrame(pF32, stride, w, h, tsNs)` — per-frame, main thread
+- `FinishRgbSession()` / `FinishDepthSession()` — async, called from `StopCapture()`
+- `WaitForBothFinished(timeoutMs)` — blocks on two `ManualResetEventSlim`s; called in finalization
+
+### `SFVideoEncoder.mm` (iOS native plugin)
+
+ObjC. Two independent `AVAssetWriter` sessions.
+
+**RGB session:**
+- Allocates a contiguous YUV buffer (`malloc`, freed via `CVPixelBufferReleaseCallback`)
+- `memcpy` the Y and CbCr planes from Unity managed memory into the buffer
+- `CVPixelBufferCreateWithPlanarBytes` wraps the buffer as `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`
+- `AVAssetWriterInputPixelBufferAdaptor.appendPixelBuffer:withPresentationTime:` feeds VideoToolbox
+
+**Depth session:**
+- `CVPixelBufferPool` of `kCVPixelFormatType_OneComponent16Half` buffers
+- Per frame: `vImageConvert_PlanarFtoPlanar16F` converts float32 → float16 (synchronous, vectorized)
+- Same adaptor/VideoToolbox path as RGB
 
 ### `ArchiveFinalizer`
 
-Post-recording packager.
-
-Responsibilities:
-- Accept the temp folder, session metadata, and frame record list from the coordinator.
-- Build `session.json` bytes using `SfzSerializer`.
-- Collect on-disk file sizes to plan the partition (if `maxPartSizeBytes > 0`).
-- Write one or more `.sfz` files using `System.IO.Compression.ZipArchive` with per-entry
-  compression levels.
-- Delete the temp folder after successful packaging.
-- Run entirely on a background `Task`; the result is polled from `ARSensorFlexRecorder.Update()`.
-
-#### Multi-part algorithm
-
-1. Compute `session.json` bytes (without parts manifest) → get byte length.
-2. Collect `(rgbSize, depthSize)` for each frame from the temp folder.
-3. Greedy bin-pack: iterate frames in order, accumulate size, start a new part when the
-   current part would exceed `maxPartSizeBytes`. A single frame is never split across parts.
-4. Assign `{sessionId}-{p:D5}-of-{total:D5}.sfz` filenames.
-5. Rebuild `session.json` with the `parts` manifest.
-6. Write each part zip, placing `session.json` only in part 0.
+Detects encoding mode by checking for `rgb.mp4` / `depth.mp4` in the temp folder:
+- **Native path:** copies MP4 files wholesale into part 0 of the SFZ; no per-frame scanning
+- **Legacy path:** unchanged `ScanStream` → per-frame zip entries
 
 ### `SfzSerializer` (`RecorderJsonSerializer.cs`)
 
-Internal static class.
-
-Responsibilities:
-- Build the complete `session.json` byte array from `SfzSessionMetadata`,
-  `List<SfzFrameRecord>`, and an optional `SfzPartPlan[]`.
-- Serialize frame records compactly (one JSON object per line in the `data` array).
-- No external JSON library; manual `StringBuilder` serialization with `G9`-formatted floats.
-
-## Data Model
-
-### `SfzFrameRecord` (struct)
-
-In-memory representation of one captured frame. Kept in a `List<SfzFrameRecord>` during recording.
-
-| Field          | Type       | Description                              |
-|----------------|------------|------------------------------------------|
-| FrameIndex     | int        | Zero-based sequential index              |
-| TimestampNs    | long       | `ARCameraFrameEventArgs.timestampNs`     |
-| Position       | Vector3    | Camera world position (metres)           |
-| Rotation       | Quaternion | Camera world rotation                    |
-| HasIntrinsics  | bool       |                                          |
-| Fx, Fy, Cx, Cy | float      | Camera intrinsics in pixels              |
-| HasColor       | bool       | Whether `rgb/NNNNNN.jpg` was written     |
-| HasDepth       | bool       | Whether `depth/NNNNNN.bin` was written   |
-
-Memory cost: ~64 bytes × frame count. At 30 fps for 10 minutes: ~18,000 frames ≈ 1.1 MB.
-
-### `SfzSessionMetadata` (struct)
-
-Session-level info assembled at `StopCapture()` time.
-
-Includes: session id, UTC start time, device model, OS string, AR framework name, FPS target,
-and the RGB + depth dimensions observed from the first successful frames.
-
-### `SfzPartPlan` (struct)
-
-One element of the multi-part partition plan.
-
-| Field      | Description                                 |
-|------------|---------------------------------------------|
-| FileName   | Basename of the output .sfz file            |
-| FrameStart | First frame index in this part (inclusive)  |
-| FrameEnd   | Last frame index in this part (exclusive)   |
+`BuildSessionJson` now accepts `bool isNativePath`.  When true:
+- Version `"1.1"`
+- Channel blocks include `"format": "hevc_mp4"` / `"hevc_float16"` and `"file"` entries
+- Per-frame `rgb`/`depth` objects are `{"file":"rgb.mp4","frame_index":N}` instead of per-file refs
 
 ## Threading Model
 
-| Thread       | Work                                                                 |
-|--------------|----------------------------------------------------------------------|
-| Main thread  | ARFoundation callbacks, image encoding, depth conversion, record accumulation |
-| Writer thread| `CaptureFolderWriter.WriteLoop` — disk IO for jpg and bin files     |
-| Task thread  | `ArchiveFinalizer.Finalize` — session.json build + zip writing       |
+### iOS
 
-Unity objects (`Texture2D`, `XRCpuImage`, `Camera.transform`) are always accessed on the
-main thread. The writer and finalizer threads only see plain byte arrays and value-type structs.
+| Thread          | Work                                                                        |
+|-----------------|-----------------------------------------------------------------------------|
+| Main thread     | ARFoundation callbacks, unsafe plane ptr access, NativeVideoEncoder calls   |
+| VideoToolbox HW | Encoding (fully managed by AVFoundation; zero CPU cores consumed)           |
+| Task thread     | `ArchiveFinalizer.Finalize` — wait for encoders, session.json build, zip    |
 
-## Intrinsics Fallback Chain
+### Non-iOS
 
-Per-frame intrinsics are resolved in this priority order:
+| Thread          | Work                                                                        |
+|-----------------|-----------------------------------------------------------------------------|
+| Main thread     | ARFoundation callbacks, image encoding, depth conversion, record accumulation|
+| Encoder ×2      | `CaptureFolderWriter.EncoderLoop` — RGBA → JPEG                             |
+| Writer          | `CaptureFolderWriter.WriterLoop` — disk IO for stream files                 |
+| Task thread     | `ArchiveFinalizer.Finalize` — session.json build + zip                      |
 
-1. `XRCameraSubsystem.TryGetIntrinsics()` — native subsystem values (most accurate)
-2. Camera FOV + frame dimensions — approximate estimate
-3. Last valid intrinsics — reused when the above two fail mid-session
+## Data Model
+
+### `SfzSessionMetadata` additions (v1.1)
+
+| Field         | Values                                    |
+|---------------|-------------------------------------------|
+| RgbEncoding   | `"hevc"` (iOS) / `"jpeg"` (non-iOS)      |
+| DepthEncoding | `"hevc_float16"` (iOS) / `"raw_float32_le"` (non-iOS) |
+
+## Coordinate System
+
+Unity world-space convention (left-handed, +Y up, +Z forward, metres). Pose `position` and
+`rotation` are read directly from `Camera.transform` and written as-is.
 
 ## Temp Folder Location
 
 `Application.temporaryCachePath/SF-Recorder/{sessionId}/`
 
-The OS may reclaim this path if the process is killed. Incomplete temp folders are not
-automatically cleaned up in that case, but the finalizer will fail with a clear error.
-The folder is deleted automatically after successful finalization.
+Contains either `rgb.mp4` + `depth.mp4` (iOS) or `rgb.stream` + `depth.stream` (non-iOS).
+Deleted automatically after successful finalization.
 
 ## Scene Setup
-
-Attach `ARSensorFlexRecorder` to the `XROrigin` GameObject (not to `ARSession`):
 
 ```
 XROrigin  ← ARSensorFlexRecorder
@@ -401,28 +315,8 @@ XROrigin  ← ARSensorFlexRecorder
        └─ AROcclusionManager  (optional, for depth)
 ```
 
-The component locates `ARCameraManager` and `AROcclusionManager` by walking down from the
-`XROrigin` camera. No explicit scene references are required.
+## Future Work
 
-## Relationship to the Player
-
-The recorder targets SFZ 1.0 exactly. The player's `SfzFileBackend` and `FileIoBackend`
-(in `SfzSessionStore.cs`) define the contract:
-
-- `session/session.json` must be present and parse as `SfzSessionJson`.
-- `tracks.frames.data[i].rgb.file` resolves relative to `session/`.
-- `tracks.frames.data[i].depth.file` resolves relative to `session/` (absent when not captured).
-- Pose `position` and `rotation` map to `Matrix4x4.TRS(position, quaternion, Vector3.one)`.
-- Intrinsics `{fx, fy, cx, cy}` map to `new Vector4(fx, fy, cx, cy)`.
-
-The temp folder layout mirrors the SFZ `session/` layout, so an unfinalized session can be
-loaded directly via the player's `FileIo` source mode for development and debugging.
-
-## Phase 2 (Future)
-
-- Scanned mesh export via `ARMeshManager` — write `scene_mesh.ply`, add `attachments.scene_mesh`
-  to `session.json`, support multi-part attachment chunking.
-- FPS throttling — currently captures every available AR frame; add frame-skip logic to enforce
-  `TargetFPS` when the device runs faster.
-- Partial session recovery — detect incomplete temp folders on next app launch and offer
-  to re-run finalization.
+- Scanned mesh export via `ARMeshManager`
+- FPS throttling (frame-skip when device runs faster than target)
+- Partial session recovery on next app launch
