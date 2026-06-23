@@ -14,7 +14,6 @@
 // Timestamps passed from C# are already session-relative (first frame = 0 ns).
 
 #import <AVFoundation/AVFoundation.h>
-#import <VideoToolbox/VideoToolbox.h>
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -140,7 +139,7 @@ void SFDepthEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
         AVVideoCompressionPropertiesKey: @{
             AVVideoExpectedSourceFrameRateKey:           @60,
             AVVideoAllowFrameReorderingKey:              @NO,
-            (NSString *)kVTCompressionPropertyKey_Lossless: @YES,
+            @"Lossless": @YES,  // kVTCompressionPropertyKey_Lossless (iOS 15.4+)
         },
     };
     gDepth.input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
