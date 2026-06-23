@@ -68,7 +68,11 @@ void SFRgbEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
                                   sourcePixelBufferAttributes:pbAttrs];
 
     [gRgb.writer addInput:gRgb.input];
-    [gRgb.writer startWriting];
+    if (![gRgb.writer startWriting]) {
+        NSLog(@"[SF] SFRgbEncoder_Start: startWriting failed: %@", gRgb.writer.error);
+        gRgb = {};
+        return;
+    }
     [gRgb.writer startSessionAtSourceTime:kCMTimeZero];
 }
 
@@ -173,7 +177,12 @@ void SFDepthEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
                             (__bridge CFDictionaryRef)poolAttrs, &gDepthPool);
 
     [gDepth.writer addInput:gDepth.input];
-    [gDepth.writer startWriting];
+    if (![gDepth.writer startWriting]) {
+        NSLog(@"[SF] SFDepthEncoder_Start: startWriting failed: %@", gDepth.writer.error);
+        if (gDepthPool) { CVPixelBufferPoolRelease(gDepthPool); gDepthPool = NULL; }
+        gDepth = {};
+        return;
+    }
     [gDepth.writer startSessionAtSourceTime:kCMTimeZero];
 }
 

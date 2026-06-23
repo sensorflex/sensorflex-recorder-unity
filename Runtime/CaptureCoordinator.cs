@@ -391,7 +391,8 @@ namespace SensorFlex.Recorder
                 bool appended = NativeVideoEncoder.AppendRgbFrame(
                     (IntPtr)pY,    planeY.rowStride,
                     (IntPtr)pCbCr, planeCbCr.rowStride,
-                    cpuImage.width, cpuImage.height, timestampNs);
+                    cpuImage.width, cpuImage.height,
+                    timestampNs - _firstTimestampNs);
 
                 if (!appended && !_warnedRgbNotReady)
                 {
@@ -439,7 +440,8 @@ namespace SensorFlex.Recorder
 
                 bool appended = NativeVideoEncoder.AppendDepthFrame(
                     (IntPtr)pF32, plane.rowStride,
-                    depthImage.width, depthImage.height, timestampNs);
+                    depthImage.width, depthImage.height,
+                    timestampNs - _firstTimestampNs);
 
                 if (!appended && !_warnedDepthNotReady)
                 {
