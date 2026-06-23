@@ -4,7 +4,7 @@
 // Two independent AVAssetWriter sessions:
 //   RGB   — YCbCr420 (BiPlanar, FullRange) via the adaptor's IOSurface-backed pool
 //   Depth — BGRA32 (float16 packed: B=low byte, G=high byte, R=0, A=0xFF),
-//            lossless HEVC for bit-exact float16 preservation
+//            max-quality HEVC (Quality=1.0) — near-lossless for smooth depth maps
 //
 // Depth packing:
 //   float32 metres → float16 (ARM hardware conversion, __fp16 cast)
@@ -131,7 +131,8 @@ void SFDepthEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
     gDepth.writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&err];
     if (!gDepth.writer) { NSLog(@"[SF] SFDepthEncoder_Start: writer creation failed: %@", err); return; }
 
-    // Lossless HEVC with BGRA32 input: bit-exact preservation of float16 depth.
+    // Max-quality HEVC (Quality=1.0) with BGRA32 input.
+    // Lossless HEVC (the "Lossless" VT property) is not supported for hvc1 on iOS and crashes.
     NSDictionary *settings = @{
         AVVideoCodecKey:  AVVideoCodecTypeHEVC,
         AVVideoWidthKey:  @(width),
@@ -139,7 +140,7 @@ void SFDepthEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
         AVVideoCompressionPropertiesKey: @{
             AVVideoExpectedSourceFrameRateKey:           @60,
             AVVideoAllowFrameReorderingKey:              @NO,
-            @"Lossless": @YES,  // kVTCompressionPropertyKey_Lossless (iOS 15.4+)
+            @"Quality": @1.0,   // kVTCompressionPropertyKey_Quality: max quality (near-lossless for smooth depth maps)
         },
     };
     gDepth.input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
