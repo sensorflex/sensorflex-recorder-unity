@@ -130,7 +130,7 @@ StopRecording
 session/
   session.json          ← version "1.1", channel format "hevc_mp4" / "hevc_bgra_float16"
   rgb.mp4               ← HEVC YCbCr420, all frames
-  depth.mp4             ← lossless HEVC BGRA32 (float16 metres packed in B+G channels)
+  depth.mp4             ← max-quality HEVC BGRA32 (float16 metres packed in B+G channels)
 ```
 
 ### v1.0 (legacy) — archive layout
@@ -183,9 +183,9 @@ session/
 **v1.1 (hevc_bgra_float16):** ARKit delivers depth as `kCVPixelFormatType_DepthFloat32` (metres).
 The native plugin converts float32 → float16 (ARM `__fp16` cast) and packs the 16-bit value into a
 BGRA32 pixel: B = low byte, G = high byte, R = 0, A = 0xFF. The CVPixelBuffer pool uses
-`kCVPixelFormatType_32BGRA` with IOSurface backing, and the HEVC session uses lossless mode
-(`"Lossless": YES` passed via `AVVideoCompressionPropertiesKey`) for bit-exact preservation.
-On decode: `bits = (G << 8) | B → view as float16 → cast float32`.
+`kCVPixelFormatType_32BGRA` with IOSurface backing, encoded at `"Quality": 1.0` (maximum HEVC
+quality; `"Lossless"` crashes hvc1 on iOS). For smooth 256×192 LiDAR depth maps, quantisation
+error is far below sensor noise (~1 cm). On decode: `bits = (G << 8) | B → view as float16 → float32`.
 
 **v1.0 (raw_float32_le):** ARKit depth is copied directly (float32 metres, row-major). ARCore
 uint16 mm depth is converted to float32 metres at capture time.
@@ -252,7 +252,7 @@ ObjC. Two independent `AVAssetWriter` sessions.
 **Depth session:**
 - Same adaptor pool pattern as RGB; pool uses `kCVPixelFormatType_32BGRA` with IOSurface backing
 - Per frame: per-pixel `__fp16` cast (float32 → float16) + bit-pack into B (low) / G (high) channels
-- Lossless HEVC (`"Lossless": YES` via `AVVideoCompressionPropertiesKey`) preserves bit patterns exactly
+- Max-quality HEVC (`"Quality": 1.0` via `AVVideoCompressionPropertiesKey`); "Lossless" is unsupported for hvc1 on iOS and crashes
 
 ### `ArchiveFinalizer`
 
