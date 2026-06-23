@@ -14,7 +14,7 @@ namespace SensorFlex.Recorder
     //
     // Version "1.1" (iOS native HEVC):
     //   channels.rgb.format   = "hevc_mp4",   channels.rgb.file   = "rgb.mp4"
-    //   channels.depth.format = "hevc_float16", channels.depth.file = "depth.mp4"
+    //   channels.depth.format = "hevc_bgra_float16", channels.depth.file = "depth.mp4"
     //   per-frame rgb   = {"file":"rgb.mp4","frame_index":N}
     //   per-frame depth = {"file":"depth.mp4","frame_index":N}
     //
@@ -119,8 +119,8 @@ namespace SensorFlex.Recorder
                 AppendInt(sb, "height", meta.DepthHeight, 6, true);
                 if (isNativePath)
                 {
-                    AppendStr(sb, "format", "hevc_float16", 6, true);
-                    AppendStr(sb, "file",   "depth.mp4",    6, true);
+                    AppendStr(sb, "format", "hevc_bgra_float16", 6, true);
+                    AppendStr(sb, "file",   "depth.mp4",         6, true);
                 }
                 else
                 {

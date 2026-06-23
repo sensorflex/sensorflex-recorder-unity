@@ -2,38 +2,33 @@
 // Hardware HEVC encoding for SensorFlex Recorder.
 //
 // Two independent AVAssetWriter sessions:
-//   RGB   — YCbCr420 (BiPlanar, FullRange) planes passed from Unity managed code
-//   Depth — float32 planes converted to float16 via vDSP, encoded as HEVC Monochrome
+//   RGB   — YCbCr420 (BiPlanar, FullRange) via the adaptor's IOSurface-backed pool
+//   Depth — BGRA32 (float16 packed: B=low byte, G=high byte, R=0, A=0xFF),
+//            lossless HEVC for bit-exact float16 preservation
 //
-// Unity passes raw plane pointers from XRCpuImage.GetPlane() NativeArrays.
-// RGB planes are memcpy'd to a malloc'd YUV buffer owned by the CVPixelBuffer;
-// the release callback frees it once AVFoundation is done.
-// Depth conversion is synchronous (vDSP) into a pooled OneComponent16Half CVPixelBuffer.
+// Depth packing:
+//   float32 metres → float16 (ARM hardware conversion, __fp16 cast)
+//   uint16_t bits  → B = bits & 0xFF,  G = bits >> 8
+//   Decoder:  bits = (G << 8) | B → view as float16 → cast to float32
+//
+// Timestamps passed from C# are already session-relative (first frame = 0 ns).
 
 #import <AVFoundation/AVFoundation.h>
-#import <Accelerate/Accelerate.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
 typedef void (*SFEncoderDoneCallback)(int success);
 
 typedef struct {
-    AVAssetWriter *writer;
-    AVAssetWriterInput *input;
-    AVAssetWriterInputPixelBufferAdaptor *adaptor;
+    AVAssetWriter                          *writer;
+    AVAssetWriterInput                     *input;
+    AVAssetWriterInputPixelBufferAdaptor   *adaptor;
 } SFEncoderSession;
 
-// ─── RGB encoder state ─────────────────────────────────────────────────────────
+// ─── RGB encoder ──────────────────────────────────────────────────────────────
 
 static SFEncoderSession gRgb = {};
-
-// Called by CoreVideo when the CVPixelBuffer wrapping our malloc'd buffer is released.
-// releaseRefCon is the malloc'd buffer pointer.
-static void SFRgbRelease(void *releaseRefCon, const void *baseAddress,
-                          size_t dataSize, size_t planeCount,
-                          const void *planeAddresses[]) {
-    free(releaseRefCon);
-}
 
 extern "C" {
 
@@ -42,26 +37,27 @@ void SFRgbEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
     NSError *err = nil;
     gRgb.writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&err];
-    if (err) { NSLog(@"[SF] SFRgbEncoder_Start writer error: %@", err); return; }
+    if (!gRgb.writer) { NSLog(@"[SF] SFRgbEncoder_Start: writer creation failed: %@", err); return; }
 
     NSDictionary *settings = @{
         AVVideoCodecKey:  AVVideoCodecTypeHEVC,
         AVVideoWidthKey:  @(width),
         AVVideoHeightKey: @(height),
         AVVideoCompressionPropertiesKey: @{
-            AVVideoExpectedSourceFrameRateKey: @30,
-            AVVideoAllowFrameReorderingKey: @NO,
+            AVVideoExpectedSourceFrameRateKey: @60,
+            AVVideoAllowFrameReorderingKey:    @NO,
         },
     };
     gRgb.input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
                                                     outputSettings:settings];
     gRgb.input.expectsMediaDataInRealTime = YES;
 
+    // IOSurface-backed pool so VideoToolbox gets zero-copy access to the pixel data.
     NSDictionary *pbAttrs = @{
-        (NSString *)kCVPixelBufferPixelFormatTypeKey:
-            @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-        (NSString *)kCVPixelBufferWidthKey:  @(width),
-        (NSString *)kCVPixelBufferHeightKey: @(height),
+        (NSString *)kCVPixelBufferPixelFormatTypeKey:       @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+        (NSString *)kCVPixelBufferWidthKey:                 @(width),
+        (NSString *)kCVPixelBufferHeightKey:                @(height),
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey:   @{},
     };
     gRgb.adaptor = [AVAssetWriterInputPixelBufferAdaptor
         assetWriterInputPixelBufferAdaptorWithAssetWriterInput:gRgb.input
@@ -82,37 +78,35 @@ int32_t SFRgbEncoder_AppendFrame(void *pY,    int32_t strideY,
                                   int32_t width, int32_t height,
                                   int64_t timestampNs) {
     if (!gRgb.input || !gRgb.input.isReadyForMoreMediaData) return 0;
+    if (!gRgb.adaptor.pixelBufferPool) return 0;
 
-    // Allocate a contiguous YUV buffer so the CVPixelBuffer owns its own memory.
-    size_t ySize  = (size_t)strideY    * (size_t)height;
-    size_t uvSize = (size_t)strideCbCr * (size_t)(height / 2);
-    uint8_t *buf  = (uint8_t *)malloc(ySize + uvSize);
-    if (!buf) return 0;
-
-    memcpy(buf,         pY,    ySize);
-    memcpy(buf + ySize, pCbCr, uvSize);
-
-    void   *planes[2]  = { buf, buf + ySize };
-    size_t  widths[2]  = { (size_t)width, (size_t)width / 2 };
-    size_t  heights[2] = { (size_t)height, (size_t)height / 2 };
-    size_t  strides[2] = { (size_t)strideY, (size_t)strideCbCr };
-
+    // Get an IOSurface-backed pixel buffer from the adaptor's own pool.
     CVPixelBufferRef pixBuf = NULL;
-    CVReturn ret = CVPixelBufferCreateWithPlanarBytes(
-        kCFAllocatorDefault,
-        (size_t)width, (size_t)height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-        buf, ySize + uvSize,
-        2, planes, widths, heights, strides,
-        SFRgbRelease, buf,   // release callback frees buf
-        NULL, &pixBuf);
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
+                                           gRgb.adaptor.pixelBufferPool,
+                                           &pixBuf) != kCVReturnSuccess || !pixBuf) return 0;
 
-    if (ret != kCVReturnSuccess || !pixBuf) { free(buf); return 0; }
+    CVPixelBufferLockBaseAddress(pixBuf, 0);
+
+    // Copy Y plane row-by-row to handle stride differences.
+    uint8_t *yDst    = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixBuf, 0);
+    size_t   yDstRow = CVPixelBufferGetBytesPerRowOfPlane(pixBuf, 0);
+    uint8_t *ySrc    = (uint8_t *)pY;
+    for (int32_t row = 0; row < height; row++)
+        memcpy(yDst + row * yDstRow, ySrc + row * (size_t)strideY, (size_t)width);
+
+    // Copy CbCr plane (width/2 pairs × 2 bytes = width bytes per row).
+    uint8_t *uvDst    = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixBuf, 1);
+    size_t   uvDstRow = CVPixelBufferGetBytesPerRowOfPlane(pixBuf, 1);
+    uint8_t *uvSrc    = (uint8_t *)pCbCr;
+    for (int32_t row = 0; row < height / 2; row++)
+        memcpy(uvDst + row * uvDstRow, uvSrc + row * (size_t)strideCbCr, (size_t)width);
+
+    CVPixelBufferUnlockBaseAddress(pixBuf, 0);
 
     CMTime time = CMTimeMake(timestampNs, 1000000000LL);
     BOOL ok = [gRgb.adaptor appendPixelBuffer:pixBuf withPresentationTime:time];
     CVPixelBufferRelease(pixBuf);
-    // buf freed by SFRgbRelease when pixBuf refcount drops to zero.
     return ok ? 1 : 0;
 }
 
@@ -127,80 +121,83 @@ void SFRgbEncoder_Finish(SFEncoderDoneCallback callback) {
     }];
 }
 
-// ─── Depth encoder state ───────────────────────────────────────────────────────
+// ─── Depth encoder ────────────────────────────────────────────────────────────
 
-static SFEncoderSession     gDepth     = {};
-static CVPixelBufferPoolRef gDepthPool = NULL;
-static int32_t              gDepthW    = 0, gDepthH = 0;
+static SFEncoderSession gDepth = {};
 
 void SFDepthEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
-    gDepthW = width; gDepthH = height;
-
     NSURL *url = [NSURL fileURLWithPath:@(mp4Path)];
     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
     NSError *err = nil;
     gDepth.writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&err];
-    if (err) { NSLog(@"[SF] SFDepthEncoder_Start writer error: %@", err); return; }
+    if (!gDepth.writer) { NSLog(@"[SF] SFDepthEncoder_Start: writer creation failed: %@", err); return; }
 
+    // Lossless HEVC with BGRA32 input: bit-exact preservation of float16 depth.
     NSDictionary *settings = @{
         AVVideoCodecKey:  AVVideoCodecTypeHEVC,
         AVVideoWidthKey:  @(width),
         AVVideoHeightKey: @(height),
         AVVideoCompressionPropertiesKey: @{
-            AVVideoExpectedSourceFrameRateKey: @30,
-            AVVideoAllowFrameReorderingKey: @NO,
+            AVVideoExpectedSourceFrameRateKey:           @60,
+            AVVideoAllowFrameReorderingKey:              @NO,
+            (NSString *)kVTCompressionPropertyKey_Lossless: @YES,
         },
     };
     gDepth.input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
                                                       outputSettings:settings];
     gDepth.input.expectsMediaDataInRealTime = YES;
 
-    // Pool of OneComponent16Half pixel buffers for the float16 depth frames.
-    NSDictionary *poolAttrs = @{
-        (NSString *)kCVPixelBufferPixelFormatTypeKey:
-            @(kCVPixelFormatType_OneComponent16Half),
-        (NSString *)kCVPixelBufferWidthKey:  @(width),
-        (NSString *)kCVPixelBufferHeightKey: @(height),
-        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
     NSDictionary *pbAttrs = @{
-        (NSString *)kCVPixelBufferPixelFormatTypeKey:
-            @(kCVPixelFormatType_OneComponent16Half),
-        (NSString *)kCVPixelBufferWidthKey:  @(width),
-        (NSString *)kCVPixelBufferHeightKey: @(height),
+        (NSString *)kCVPixelBufferPixelFormatTypeKey:       @(kCVPixelFormatType_32BGRA),
+        (NSString *)kCVPixelBufferWidthKey:                 @(width),
+        (NSString *)kCVPixelBufferHeightKey:                @(height),
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey:   @{},
     };
     gDepth.adaptor = [AVAssetWriterInputPixelBufferAdaptor
         assetWriterInputPixelBufferAdaptorWithAssetWriterInput:gDepth.input
                                   sourcePixelBufferAttributes:pbAttrs];
 
-    CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
-                            (__bridge CFDictionaryRef)poolAttrs, &gDepthPool);
-
     [gDepth.writer addInput:gDepth.input];
     if (![gDepth.writer startWriting]) {
         NSLog(@"[SF] SFDepthEncoder_Start: startWriting failed: %@", gDepth.writer.error);
-        if (gDepthPool) { CVPixelBufferPoolRelease(gDepthPool); gDepthPool = NULL; }
         gDepth = {};
         return;
     }
     [gDepth.writer startSessionAtSourceTime:kCMTimeZero];
 }
 
-// pF32: pointer to float32 depth plane (metres, row-major).
+// pF32: float32 depth plane (metres, row-major).  stride is in bytes.
 // Returns 1 on success, 0 if input not ready (frame dropped).
 int32_t SFDepthEncoder_AppendFrame(void *pF32, int32_t stride,
                                     int32_t width, int32_t height,
                                     int64_t timestampNs) {
-    if (!gDepth.input || !gDepth.input.isReadyForMoreMediaData || !gDepthPool) return 0;
+    if (!gDepth.input || !gDepth.input.isReadyForMoreMediaData) return 0;
+    if (!gDepth.adaptor.pixelBufferPool) return 0;
 
     CVPixelBufferRef dstBuf = NULL;
-    CVReturn ret = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, gDepthPool, &dstBuf);
-    if (ret != kCVReturnSuccess || !dstBuf) return 0;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
+                                           gDepth.adaptor.pixelBufferPool,
+                                           &dstBuf) != kCVReturnSuccess || !dstBuf) return 0;
 
     CVPixelBufferLockBaseAddress(dstBuf, 0);
-    vImage_Buffer srcVI = { pF32, (vImagePixelCount)height, (vImagePixelCount)width, (size_t)stride };
-    vImage_Buffer dstVI = { CVPixelBufferGetBaseAddress(dstBuf), (vImagePixelCount)height, (vImagePixelCount)width, CVPixelBufferGetBytesPerRow(dstBuf) };
-    vImageConvert_PlanarFtoPlanar16F(&srcVI, &dstVI, kvImageNoFlags);
+    uint8_t *dstBase        = (uint8_t *)CVPixelBufferGetBaseAddress(dstBuf);
+    size_t   dstStride      = CVPixelBufferGetBytesPerRow(dstBuf);
+    float   *srcBase        = (float *)pF32;
+    int32_t  srcFloatStride = stride / 4;  // byte stride → float elements per row
+
+    for (int32_t row = 0; row < height; row++) {
+        uint8_t *dstRow = dstBase + row * dstStride;
+        float   *srcRow = srcBase + row * srcFloatStride;
+        for (int32_t col = 0; col < width; col++) {
+            __fp16 h = (__fp16)srcRow[col];  // float32 → float16 (ARM hardware)
+            uint16_t bits;
+            memcpy(&bits, &h, sizeof(bits));
+            dstRow[col * 4 + 0] = (uint8_t)(bits & 0xFF);          // B = low byte
+            dstRow[col * 4 + 1] = (uint8_t)((bits >> 8) & 0xFF);   // G = high byte
+            dstRow[col * 4 + 2] = 0;                                // R = unused
+            dstRow[col * 4 + 3] = 0xFF;                             // A = opaque
+        }
+    }
     CVPixelBufferUnlockBaseAddress(dstBuf, 0);
 
     CMTime time = CMTimeMake(timestampNs, 1000000000LL);
@@ -215,7 +212,6 @@ void SFDepthEncoder_Finish(SFEncoderDoneCallback callback) {
     [gDepth.writer finishWritingWithCompletionHandler:^{
         int ok = (gDepth.writer.status == AVAssetWriterStatusCompleted) ? 1 : 0;
         if (!ok) NSLog(@"[SF] SFDepthEncoder_Finish failed: %@", gDepth.writer.error);
-        if (gDepthPool) { CVPixelBufferPoolRelease(gDepthPool); gDepthPool = NULL; }
         gDepth = {};
         if (callback) callback(ok);
     }];

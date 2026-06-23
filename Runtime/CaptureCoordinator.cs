@@ -205,7 +205,7 @@ namespace SensorFlex.Recorder
                 DepthHeight  = _firstDepthH,
                 DepthSensor  = _depthSensor,
                 RgbEncoding  = _useNativeEncoder ? "hevc" : "jpeg",
-                DepthEncoding = _useNativeEncoder ? "hevc_float16" : "raw_float32_le",
+                DepthEncoding = _useNativeEncoder ? "hevc_bgra_float16" : "raw_float32_le",
             };
 
             Debug.Log($"[SF-Recorder] Capture stopped. Frames={FrameRecords.Count} ActualFPS={SessionMetadata.Fps}");
