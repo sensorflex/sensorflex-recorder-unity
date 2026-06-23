@@ -39,7 +39,7 @@ after recording stops.
  │  color ──► NativeVideoEncoder.AppendRgbFrame()           │
  │            (IntPtr to Y+CbCr planes; ~4 MB memcpy)       │
  │  depth ──► NativeVideoEncoder.AppendDepthFrame()         │
- │            (IntPtr to float32 plane; vDSP → float16)     │
+ │            (IntPtr to float32 plane; → float16 BGRA pack) │
  │  pose  ──► position + quaternion (Camera.transform)      │
  │  intrin ──► native › FOV estimate › cached fallback      │
  │                                                          │
@@ -128,9 +128,9 @@ StopRecording
 
 ```
 session/
-  session.json          ← version "1.1", channel format "hevc_mp4" / "hevc_float16"
+  session.json          ← version "1.1", channel format "hevc_mp4" / "hevc_bgra_float16"
   rgb.mp4               ← HEVC YCbCr420, all frames
-  depth.mp4             ← HEVC OneComponent16Half (float16 metres), all frames
+  depth.mp4             ← lossless HEVC BGRA32 (float16 metres packed in B+G channels)
 ```
 
 ### v1.0 (legacy) — archive layout
@@ -155,10 +155,10 @@ session/
   "tracks": {
     "frames": {
       "metadata": {
-        "fps": 30,
+        "fps": 60,
         "channels": {
-          "rgb":   { "width": 1920, "height": 1440, "format": "hevc_mp4",    "file": "rgb.mp4" },
-          "depth": { "width": 256,  "height": 192,  "format": "hevc_float16","file": "depth.mp4",
+          "rgb":   { "width": 1920, "height": 1440, "format": "hevc_mp4",         "file": "rgb.mp4" },
+          "depth": { "width": 256,  "height": 192,  "format": "hevc_bgra_float16", "file": "depth.mp4",
                      "units": "meters", "sensor": "arkit_lidar", "invalid_value": 0.0 }
         }
       },
@@ -180,10 +180,12 @@ session/
 
 ### Depth encoding
 
-**v1.1 (hevc_float16):** ARKit delivers depth as `kCVPixelFormatType_DepthFloat32` (metres).
-The native plugin converts float32 → float16 via `vImageConvert_PlanarFtoPlanar16F` into a
-`kCVPixelFormatType_OneComponent16Half` CVPixelBuffer, then encodes with HEVC Monochrome.
-On decode, the uint16 luma bit pattern is reinterpreted as IEEE 754 float16 to recover metres.
+**v1.1 (hevc_bgra_float16):** ARKit delivers depth as `kCVPixelFormatType_DepthFloat32` (metres).
+The native plugin converts float32 → float16 (ARM `__fp16` cast) and packs the 16-bit value into a
+BGRA32 pixel: B = low byte, G = high byte, R = 0, A = 0xFF. The CVPixelBuffer pool uses
+`kCVPixelFormatType_32BGRA` with IOSurface backing, and the HEVC session uses lossless mode
+(`"Lossless": YES` passed via `AVVideoCompressionPropertiesKey`) for bit-exact preservation.
+On decode: `bits = (G << 8) | B → view as float16 → cast float32`.
 
 **v1.0 (raw_float32_le):** ARKit depth is copied directly (float32 metres, row-major). ARCore
 uint16 mm depth is converted to float32 metres at capture time.
@@ -243,15 +245,14 @@ Key methods:
 ObjC. Two independent `AVAssetWriter` sessions.
 
 **RGB session:**
-- Allocates a contiguous YUV buffer (`malloc`, freed via `CVPixelBufferReleaseCallback`)
-- `memcpy` the Y and CbCr planes from Unity managed memory into the buffer
-- `CVPixelBufferCreateWithPlanarBytes` wraps the buffer as `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`
+- `CVPixelBufferPoolCreatePixelBuffer` from the adaptor's own IOSurface-backed pool
+- Per frame: row-by-row `memcpy` of Y plane and CbCr plane into the locked pixel buffer
 - `AVAssetWriterInputPixelBufferAdaptor.appendPixelBuffer:withPresentationTime:` feeds VideoToolbox
 
 **Depth session:**
-- `CVPixelBufferPool` of `kCVPixelFormatType_OneComponent16Half` buffers
-- Per frame: `vImageConvert_PlanarFtoPlanar16F` converts float32 → float16 (synchronous, vectorized)
-- Same adaptor/VideoToolbox path as RGB
+- Same adaptor pool pattern as RGB; pool uses `kCVPixelFormatType_32BGRA` with IOSurface backing
+- Per frame: per-pixel `__fp16` cast (float32 → float16) + bit-pack into B (low) / G (high) channels
+- Lossless HEVC (`"Lossless": YES` via `AVVideoCompressionPropertiesKey`) preserves bit patterns exactly
 
 ### `ArchiveFinalizer`
 
@@ -263,7 +264,7 @@ Detects encoding mode by checking for `rgb.mp4` / `depth.mp4` in the temp folder
 
 `BuildSessionJson` now accepts `bool isNativePath`.  When true:
 - Version `"1.1"`
-- Channel blocks include `"format": "hevc_mp4"` / `"hevc_float16"` and `"file"` entries
+- Channel blocks include `"format": "hevc_mp4"` / `"hevc_bgra_float16"` and `"file"` entries
 - Per-frame `rgb`/`depth` objects are `{"file":"rgb.mp4","frame_index":N}` instead of per-file refs
 
 ## Threading Model
@@ -292,7 +293,7 @@ Detects encoding mode by checking for `rgb.mp4` / `depth.mp4` in the temp folder
 | Field         | Values                                    |
 |---------------|-------------------------------------------|
 | RgbEncoding   | `"hevc"` (iOS) / `"jpeg"` (non-iOS)      |
-| DepthEncoding | `"hevc_float16"` (iOS) / `"raw_float32_le"` (non-iOS) |
+| DepthEncoding | `"hevc_bgra_float16"` (iOS) / `"raw_float32_le"` (non-iOS) |
 
 ## Coordinate System
 
