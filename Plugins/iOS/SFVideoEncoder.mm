@@ -1,19 +1,17 @@
 // SFVideoEncoder.mm
-// Hardware HEVC encoding for SensorFlex Recorder.
+// Hardware HEVC encoding for SensorFlex Recorder — RGB path.
+// LZ4 depth writer using Apple Compression framework.
 //
-// Two independent AVAssetWriter sessions:
-//   RGB   — YCbCr420 (BiPlanar, FullRange) via the adaptor's IOSurface-backed pool
-//   Depth — BGRA32 (float16 packed: B=low byte, G=high byte, R=0, A=0xFF),
-//            max-quality HEVC (Quality=1.0) — near-lossless for smooth depth maps
+// RGB: YCbCr420 (BiPlanar, FullRange) via AVFoundation + VideoToolbox HEVC → rgb.mp4
+// Depth: float32 metres → COMPRESSION_LZ4_RAW → depth.bin (raw concatenated blocks)
+//         Compressed byte count per frame → depth_sizes.bin (int32 per frame, little-endian)
 //
-// Depth packing:
-//   float32 metres → float16 (ARM hardware conversion, __fp16 cast)
-//   uint16_t bits  → B = bits & 0xFF,  G = bits >> 8
-//   Decoder:  bits = (G << 8) | B → view as float16 → cast to float32
+// depth.bin is compatible with K4os.Compression.LZ4 LZ4Codec.Decode on the player side.
 //
-// Timestamps passed from C# are already session-relative (first frame = 0 ns).
+// Timestamps passed from C# are session-relative nanoseconds (first frame = 0 ns).
 
 #import <AVFoundation/AVFoundation.h>
+#include <compression.h>
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
@@ -79,7 +77,6 @@ int32_t SFRgbEncoder_AppendFrame(void *pY,    int32_t strideY,
     if (!gRgb.input || !gRgb.input.isReadyForMoreMediaData) return 0;
     if (!gRgb.adaptor.pixelBufferPool) return 0;
 
-    // Get an IOSurface-backed pixel buffer from the adaptor's own pool.
     CVPixelBufferRef pixBuf = NULL;
     if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
                                            gRgb.adaptor.pixelBufferPool,
@@ -94,7 +91,7 @@ int32_t SFRgbEncoder_AppendFrame(void *pY,    int32_t strideY,
     for (int32_t row = 0; row < height; row++)
         memcpy(yDst + row * yDstRow, ySrc + row * (size_t)strideY, (size_t)width);
 
-    // Copy CbCr plane (width/2 pairs × 2 bytes = width bytes per row).
+    // Copy CbCr plane (width bytes per row).
     uint8_t *uvDst    = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixBuf, 1);
     size_t   uvDstRow = CVPixelBufferGetBytesPerRowOfPlane(pixBuf, 1);
     uint8_t *uvSrc    = (uint8_t *)pCbCr;
@@ -120,101 +117,77 @@ void SFRgbEncoder_Finish(SFEncoderDoneCallback callback) {
     }];
 }
 
-// ─── Depth encoder ────────────────────────────────────────────────────────────
+// ─── Depth LZ4 writer ─────────────────────────────────────────────────────────
+//
+// Each depth frame: copy float32 plane → COMPRESSION_LZ4_RAW → append to depth.bin.
+// Compressed byte count (int32 LE) appended to depth_sizes.bin.
+// Both writes happen on a serial GCD queue (background thread).
 
-static SFEncoderSession gDepth = {};
+static dispatch_queue_t gDepthQueue    = NULL;
+static FILE            *gDepthBinFile  = NULL;
+static FILE            *gDepthSizFile  = NULL;
 
-void SFDepthEncoder_Start(const char *mp4Path, int32_t width, int32_t height) {
-    NSURL *url = [NSURL fileURLWithPath:@(mp4Path)];
-    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
-    NSError *err = nil;
-    gDepth.writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&err];
-    if (!gDepth.writer) { NSLog(@"[SF] SFDepthEncoder_Start: writer creation failed: %@", err); return; }
-
-    // Max-quality HEVC (Quality=1.0) with BGRA32 input.
-    // Lossless HEVC (the "Lossless" VT property) is not supported for hvc1 on iOS and crashes.
-    NSDictionary *settings = @{
-        AVVideoCodecKey:  AVVideoCodecTypeHEVC,
-        AVVideoWidthKey:  @(width),
-        AVVideoHeightKey: @(height),
-        AVVideoCompressionPropertiesKey: @{
-            AVVideoExpectedSourceFrameRateKey:           @60,
-            AVVideoAllowFrameReorderingKey:              @NO,
-            @"Quality": @1.0,   // kVTCompressionPropertyKey_Quality: max quality (near-lossless for smooth depth maps)
-        },
-    };
-    gDepth.input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                                      outputSettings:settings];
-    gDepth.input.expectsMediaDataInRealTime = YES;
-
-    NSDictionary *pbAttrs = @{
-        (NSString *)kCVPixelBufferPixelFormatTypeKey:       @(kCVPixelFormatType_32BGRA),
-        (NSString *)kCVPixelBufferWidthKey:                 @(width),
-        (NSString *)kCVPixelBufferHeightKey:                @(height),
-        (NSString *)kCVPixelBufferIOSurfacePropertiesKey:   @{},
-    };
-    gDepth.adaptor = [AVAssetWriterInputPixelBufferAdaptor
-        assetWriterInputPixelBufferAdaptorWithAssetWriterInput:gDepth.input
-                                  sourcePixelBufferAttributes:pbAttrs];
-
-    [gDepth.writer addInput:gDepth.input];
-    if (![gDepth.writer startWriting]) {
-        NSLog(@"[SF] SFDepthEncoder_Start: startWriting failed: %@", gDepth.writer.error);
-        gDepth = {};
+void SFDepthLz4_Start(const char *binPath, const char *sizesPath,
+                       int32_t width, int32_t height) {
+    remove(binPath);
+    remove(sizesPath);
+    gDepthBinFile = fopen(binPath,   "wb");
+    gDepthSizFile = fopen(sizesPath, "wb");
+    if (!gDepthBinFile || !gDepthSizFile) {
+        NSLog(@"[SF] SFDepthLz4_Start: failed to open output files");
         return;
     }
-    [gDepth.writer startSessionAtSourceTime:kCMTimeZero];
+    gDepthQueue = dispatch_queue_create("com.sensorflex.depth_lz4",
+                                         DISPATCH_QUEUE_SERIAL);
 }
 
-// pF32: float32 depth plane (metres, row-major).  stride is in bytes.
-// Returns 1 on success, 0 if input not ready (frame dropped).
-int32_t SFDepthEncoder_AppendFrame(void *pF32, int32_t stride,
-                                    int32_t width, int32_t height,
-                                    int64_t timestampNs) {
-    if (!gDepth.input || !gDepth.input.isReadyForMoreMediaData) return 0;
-    if (!gDepth.adaptor.pixelBufferPool) return 0;
+// Copy depth plane, enqueue LZ4 compression + write to background queue.
+// Returns 1 if successfully enqueued, 0 on failure (frame dropped).
+int32_t SFDepthLz4_AppendFrame(void *pF32, int32_t stride,
+                                 int32_t width, int32_t height) {
+    if (!gDepthQueue) return 0;
 
-    CVPixelBufferRef dstBuf = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
-                                           gDepth.adaptor.pixelBufferPool,
-                                           &dstBuf) != kCVReturnSuccess || !dstBuf) return 0;
+    int32_t srcSize = width * height * 4;
+    void *buf = malloc(srcSize);
+    if (!buf) return 0;
 
-    CVPixelBufferLockBaseAddress(dstBuf, 0);
-    uint8_t *dstBase        = (uint8_t *)CVPixelBufferGetBaseAddress(dstBuf);
-    size_t   dstStride      = CVPixelBufferGetBytesPerRow(dstBuf);
-    float   *srcBase        = (float *)pF32;
-    int32_t  srcFloatStride = stride / 4;  // byte stride → float elements per row
+    // Row-by-row copy to de-stride the plane (ARKit stride may exceed width*4).
+    for (int32_t row = 0; row < height; row++)
+        memcpy((char*)buf + row * width * 4,
+               (char*)pF32 + row * stride,
+               width * 4);
 
-    for (int32_t row = 0; row < height; row++) {
-        uint8_t *dstRow = dstBase + row * dstStride;
-        float   *srcRow = srcBase + row * srcFloatStride;
-        for (int32_t col = 0; col < width; col++) {
-            __fp16 h = (__fp16)srcRow[col];  // float32 → float16 (ARM hardware)
-            uint16_t bits;
-            memcpy(&bits, &h, sizeof(bits));
-            dstRow[col * 4 + 0] = (uint8_t)(bits & 0xFF);          // B = low byte
-            dstRow[col * 4 + 1] = (uint8_t)((bits >> 8) & 0xFF);   // G = high byte
-            dstRow[col * 4 + 2] = 0;                                // R = unused
-            dstRow[col * 4 + 3] = 0xFF;                             // A = opaque
+    dispatch_async(gDepthQueue, ^{
+        // LZ4 worst-case: srcSize + srcSize/255 + 16; use +1/8 + 256 for safety.
+        size_t maxDst = (size_t)srcSize + (srcSize >> 3) + 256;
+        void  *dst    = malloc(maxDst);
+        size_t compLen = 0;
+        if (dst)
+            compLen = compression_encode_buffer(dst, maxDst,
+                                                (const uint8_t *)buf, srcSize,
+                                                NULL, COMPRESSION_LZ4_RAW);
+        free(buf);
+
+        if (compLen > 0 && gDepthBinFile && gDepthSizFile) {
+            fwrite(dst, 1, compLen, gDepthBinFile);
+            int32_t len32 = (int32_t)compLen;
+            fwrite(&len32, sizeof(int32_t), 1, gDepthSizFile);
         }
-    }
-    CVPixelBufferUnlockBaseAddress(dstBuf, 0);
-
-    CMTime time = CMTimeMake(timestampNs, 1000000000LL);
-    BOOL ok = [gDepth.adaptor appendPixelBuffer:dstBuf withPresentationTime:time];
-    CVPixelBufferRelease(dstBuf);
-    return ok ? 1 : 0;
+        if (dst) free(dst);
+    });
+    return 1;
 }
 
-void SFDepthEncoder_Finish(SFEncoderDoneCallback callback) {
-    if (!gDepth.input) { if (callback) callback(0); return; }
-    [gDepth.input markAsFinished];
-    [gDepth.writer finishWritingWithCompletionHandler:^{
-        int ok = (gDepth.writer.status == AVAssetWriterStatusCompleted) ? 1 : 0;
-        if (!ok) NSLog(@"[SF] SFDepthEncoder_Finish failed: %@", gDepth.writer.error);
-        gDepth = {};
-        if (callback) callback(ok);
-    }];
+// Drain the serial queue, close both files, then invoke callback.
+void SFDepthLz4_Finish(SFEncoderDoneCallback callback) {
+    if (!gDepthQueue) { if (callback) callback(1); return; }
+    dispatch_queue_t q = gDepthQueue;
+    gDepthQueue = NULL;   // prevent new appends from enqueueing
+    dispatch_async(q, ^{
+        if (gDepthBinFile) { fclose(gDepthBinFile); gDepthBinFile = NULL; }
+        if (gDepthSizFile) { fclose(gDepthSizFile); gDepthSizFile = NULL; }
+        if (callback) callback(1);
+    });
 }
 
 } // extern "C"

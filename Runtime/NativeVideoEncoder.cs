@@ -6,10 +6,16 @@ using AOT;
 namespace SensorFlex.Recorder
 {
     // P/Invoke bridge to SFVideoEncoder.mm.
-    // All public methods are safe to call on any platform; they no-op on non-iOS.
-    // On iOS the native plugin encodes RGB via HEVC YCbCr420 and depth via HEVC
-    // OneComponent16Half.  Both sessions run concurrently and are waited on via
-    // ManualResetEventSlim in WaitForBothFinished().
+    // All public methods are safe to call on any platform; non-iOS builds get no-op stubs.
+    //
+    // RGB  session: HEVC YCbCr420 → rgb.mp4
+    // Depth writer: COMPRESSION_LZ4_RAW float32 → depth.bin + depth_sizes.bin
+    //
+    // Call pattern:
+    //   StartRgbSession / StartDepthLz4Writer  (at first frame)
+    //   AppendRgbFrame / AppendDepthLz4Frame   (each frame, main thread)
+    //   FinishRgbSession / FinishDepthLz4Session (at StopCapture)
+    //   WaitForBothFinished                     (in ArchiveFinalizer, background thread)
     internal static class NativeVideoEncoder
     {
 #if UNITY_IOS && !UNITY_EDITOR
@@ -19,23 +25,23 @@ namespace SensorFlex.Recorder
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         delegate void EncoderDoneCallback(int success);
 
+        // RGB
         [DllImport("__Internal")] static extern void    SFRgbEncoder_Start(string path, int w, int h);
         [DllImport("__Internal")] static extern int     SFRgbEncoder_AppendFrame(IntPtr pY,    int strideY,
                                                                                   IntPtr pCbCr, int strideCbCr,
                                                                                   int w, int h, long tsNs);
         [DllImport("__Internal")] static extern void    SFRgbEncoder_Finish(EncoderDoneCallback cb);
 
-        [DllImport("__Internal")] static extern void    SFDepthEncoder_Start(string path, int w, int h);
-        [DllImport("__Internal")] static extern int     SFDepthEncoder_AppendFrame(IntPtr pF32, int stride,
-                                                                                    int w, int h, long tsNs);
-        [DllImport("__Internal")] static extern void    SFDepthEncoder_Finish(EncoderDoneCallback cb);
+        // Depth LZ4
+        [DllImport("__Internal")] static extern void    SFDepthLz4_Start(string binPath, string sizesPath, int w, int h);
+        [DllImport("__Internal")] static extern int     SFDepthLz4_AppendFrame(IntPtr pF32, int stride, int w, int h);
+        [DllImport("__Internal")] static extern void    SFDepthLz4_Finish(EncoderDoneCallback cb);
 
         // ── Completion events ──────────────────────────────────────────────────
 
         static readonly ManualResetEventSlim _rgbDone   = new ManualResetEventSlim(false);
         static readonly ManualResetEventSlim _depthDone = new ManualResetEventSlim(false);
 
-        // Hold static delegate references to prevent GC collection.
         static readonly EncoderDoneCallback _onRgbDone   = OnRgbDone;
         static readonly EncoderDoneCallback _onDepthDone = OnDepthDone;
 
@@ -59,17 +65,16 @@ namespace SensorFlex.Recorder
 
         public static void FinishRgbSession() => SFRgbEncoder_Finish(_onRgbDone);
 
-        public static void StartDepthSession(string mp4Path, int width, int height)
+        public static void StartDepthLz4Writer(string binPath, string sizesPath, int width, int height)
         {
             _depthDone.Reset();
-            SFDepthEncoder_Start(mp4Path, width, height);
+            SFDepthLz4_Start(binPath, sizesPath, width, height);
         }
 
-        public static bool AppendDepthFrame(IntPtr pF32, int stride,
-                                             int width, int height, long timestampNs)
-            => SFDepthEncoder_AppendFrame(pF32, stride, width, height, timestampNs) != 0;
+        public static bool AppendDepthLz4Frame(IntPtr pF32, int stride, int width, int height)
+            => SFDepthLz4_AppendFrame(pF32, stride, width, height) != 0;
 
-        public static void FinishDepthSession() => SFDepthEncoder_Finish(_onDepthDone);
+        public static void FinishDepthLz4Session() => SFDepthLz4_Finish(_onDepthDone);
 
         public static void WaitForBothFinished(int timeoutMs)
         {
@@ -85,10 +90,9 @@ namespace SensorFlex.Recorder
                                            int width, int height, long timestampNs) => false;
         public static void FinishRgbSession() { }
 
-        public static void StartDepthSession(string mp4Path, int width, int height) { }
-        public static bool AppendDepthFrame(IntPtr pF32, int stride,
-                                             int width, int height, long timestampNs) => false;
-        public static void FinishDepthSession() { }
+        public static void StartDepthLz4Writer(string binPath, string sizesPath, int width, int height) { }
+        public static bool AppendDepthLz4Frame(IntPtr pF32, int stride, int width, int height) => false;
+        public static void FinishDepthLz4Session() { }
 
         public static void WaitForBothFinished(int timeoutMs) { }
 #endif

@@ -15,11 +15,11 @@ namespace SensorFlex.Recorder
         // ── Events ─────────────────────────────────────────────────────────
 
         // Invoked on the main thread when capture successfully starts.
-        // Argument: the temp folder path where binary frame files are being written.
+        // Argument: the temp folder path where binary files are being written.
         public event Action<string> RecordingStartedEvent;
 
         // Invoked on the main thread when finalization completes.
-        // Argument: array of output .sfz paths (length 1 for single-file, N for multi-part).
+        // Argument: output .sfz path (single file, always length 1).
         public event Action<string[]> RecordingFinalizedEvent;
 
         // Invoked on the main thread on any failure (start or finalization).
@@ -36,10 +36,10 @@ namespace SensorFlex.Recorder
         [Tooltip("Optional session identifier override. Leave empty to auto-generate.")]
         [SerializeField] string m_SessionId = "";
 
-        [Tooltip("Capture RGB frames.")]
+        [Tooltip("Capture RGB frames (iOS only).")]
         [SerializeField] bool m_CaptureColor = true;
 
-        [Tooltip("Capture environment depth when supported.")]
+        [Tooltip("Capture environment depth when supported (iOS only).")]
         [SerializeField] bool m_CaptureDepth = true;
 
         [Tooltip("Capture tracked camera pose.")]
@@ -51,10 +51,6 @@ namespace SensorFlex.Recorder
         [Header("Output")]
         [Tooltip("Relative (to persistentDataPath) or absolute output directory.")]
         [SerializeField] string m_OutputDirectory = "SensorFlexRecordings";
-
-        [Tooltip("Maximum size in MB per .sfz part file. 0 = single file with no size limit.")]
-        [Min(0)]
-        [SerializeField] int m_MaxPartSizeMb = 500;
 
         [Tooltip("Maximum recording duration in seconds. 0 = unlimited.")]
         [Min(0)]
@@ -73,17 +69,17 @@ namespace SensorFlex.Recorder
 
         // ── Exposed config (read by CaptureCoordinator) ────────────────────
 
-        internal string SessionId            => string.IsNullOrEmpty(m_SessionId)
-                                                   ? (ActiveSessionId ?? Guid.NewGuid().ToString("N"))
-                                                   : m_SessionId;
-        internal bool   CaptureColor         => m_CaptureColor;
-        internal bool   CaptureDepth         => m_CaptureDepth;
-        internal bool   CapturePose          => m_CapturePose;
-        internal bool   CaptureIntrinsics    => m_CaptureIntrinsics;
-        internal int    MaxRecordingSeconds  => m_MaxRecordingSeconds;
-        internal string OutputDirectory      => Path.IsPathRooted(m_OutputDirectory)
-                                                   ? m_OutputDirectory
-                                                   : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
+        internal string SessionId           => string.IsNullOrEmpty(m_SessionId)
+                                                  ? (ActiveSessionId ?? Guid.NewGuid().ToString("N"))
+                                                  : m_SessionId;
+        internal bool   CaptureColor        => m_CaptureColor;
+        internal bool   CaptureDepth        => m_CaptureDepth;
+        internal bool   CapturePose         => m_CapturePose;
+        internal bool   CaptureIntrinsics   => m_CaptureIntrinsics;
+        internal int    MaxRecordingSeconds => m_MaxRecordingSeconds;
+        internal string OutputDirectory     => Path.IsPathRooted(m_OutputDirectory)
+                                                  ? m_OutputDirectory
+                                                  : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
 
         // ── Private ────────────────────────────────────────────────────────
 
@@ -149,7 +145,7 @@ namespace SensorFlex.Recorder
                 else
                 {
                     LastArchivePaths = task.Result;
-                    Debug.Log($"[SF-Recorder] Finalization complete. Parts={LastArchivePaths.Length} First='{LastArchivePaths[0]}'");
+                    Debug.Log($"[SF-Recorder] Finalization complete. Output='{LastArchivePaths[0]}'");
                     RecordingFinalizedEvent?.Invoke(LastArchivePaths);
                 }
             }
@@ -191,7 +187,7 @@ namespace SensorFlex.Recorder
             }
 
             IsRecording = true;
-            Debug.Log($"[SF-Recorder] Recording started. Session='{ActiveSessionId}' TempDir='{tempDir}' MaxSeconds={m_MaxRecordingSeconds}");
+            Debug.Log($"[SF-Recorder] Recording started. Session='{ActiveSessionId}' TempDir='{tempDir}'");
             RecordingStartedEvent?.Invoke(tempDir);
         }
 
@@ -206,8 +202,6 @@ namespace SensorFlex.Recorder
 
         // ── Private helpers ────────────────────────────────────────────────
 
-        // Pulls coordinator state, tears it down, and starts async finalization.
-        // Must only be called once per recording session (from StopRecording or limit path).
         void BeginFinalization()
         {
             if (_coordinator == null)
@@ -215,10 +209,9 @@ namespace SensorFlex.Recorder
 
             _coordinator.StopCapture();
 
-            string             tempDir   = _coordinator.TempDir;
-            var                meta      = _coordinator.SessionMetadata;
-            var                records   = _coordinator.FrameRecords;
-            CaptureFolderWriter writer   = _coordinator.Writer;
+            string tempDir  = _coordinator.TempDir;
+            var    meta     = _coordinator.SessionMetadata;
+            var    records  = _coordinator.FrameRecords;
 
             _coordinator.Dispose();
             _coordinator = null;
@@ -233,12 +226,8 @@ namespace SensorFlex.Recorder
                 ? m_OutputDirectory
                 : Path.Combine(Application.persistentDataPath, m_OutputDirectory);
 
-            long maxBytes = m_MaxPartSizeMb > 0
-                ? (long)m_MaxPartSizeMb * 1024L * 1024L
-                : 0L;
-
             IsFinalizing      = true;
-            _finalizationTask = ArchiveFinalizer.FinalizeAsync(tempDir, outputDir, meta, records, writer, maxBytes);
+            _finalizationTask = ArchiveFinalizer.FinalizeAsync(tempDir, outputDir, meta, records);
             Debug.Log($"[SF-Recorder] Recording stopped ({records.Count} frames). Finalizing archive...");
         }
     }

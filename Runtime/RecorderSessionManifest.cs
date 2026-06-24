@@ -2,21 +2,21 @@ using UnityEngine;
 
 namespace SensorFlex.Recorder
 {
-    // Per-frame record kept in memory during recording and serialized into
-    // session.json tracks.frames.data at finalization time.
+    // Per-frame record kept in memory during recording.
+    // Serialized into frames.jsonl at finalization time.
     internal struct SfzFrameRecord
     {
-        public int      FrameIndex;
-        public long     TimestampNs;
-        public Vector3  Position;
+        public int        FrameIndex;
+        public long       TimestampNs;
+        public Vector3    Position;
         public Quaternion Rotation;
-        public bool     HasIntrinsics;
-        public float    Fx, Fy, Cx, Cy;
-        public bool     HasColor;
-        public bool     HasDepth;
+        public bool       HasIntrinsics;
+        public float      Fx, Fy, Cx, Cy;
+        public bool       HasColor;
+        public bool       HasDepth;
     }
 
-    // Session-level info collected at StartCapture time.
+    // Session-level metadata collected at StopCapture time.
     internal struct SfzSessionMetadata
     {
         public string SessionId;
@@ -25,26 +25,12 @@ namespace SensorFlex.Recorder
         public string DeviceOs;
         public string ArFramework;
         public int    Fps;
-        // Populated from the first successful frame.
+        public int    FrameCount;
+        // Dimensions populated from the first successful frame.
         public bool   HasRgb;
         public int    RgbWidth, RgbHeight;
         public bool   HasDepth;
         public int    DepthWidth, DepthHeight;
-        public string DepthSensor;    // e.g. "arcore_environment_depth"
-        // Encoding path selected at capture time.
-        // "hevc"         — iOS native; session/rgb.mp4 (HEVC YCbCr420)
-        // "jpeg"         — managed software; session/rgb/NNNNNN.jpg
-        public string RgbEncoding;
-        // "hevc_float16" — iOS native; session/depth.mp4 (HEVC OneComponent16Half, metres)
-        // "raw_float32_le" — managed; session/depth/NNNNNN.bin (float32 LE metres)
-        public string DepthEncoding;
-    }
-
-    // One entry in the multi-part plan; FrameStart inclusive, FrameEnd exclusive.
-    internal struct SfzPartPlan
-    {
-        public string FileName;    // basename only, e.g. "abc-00001-of-00003.sfz"
-        public int    FrameStart;
-        public int    FrameEnd;
+        public string DepthSensor;    // e.g. "arkit_lidar", "arcore_environment_depth"
     }
 }

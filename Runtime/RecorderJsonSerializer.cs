@@ -4,226 +4,124 @@ using System.Text;
 
 namespace SensorFlex.Recorder
 {
-    // Builds session.json for SFZ archives.
+    // Builds SFZ v2.0 metadata files.
     //
-    // Version "1.0" (legacy, non-iOS):
-    //   channels.rgb.format  = "jpeg"
-    //   channels.depth.format = "raw_float32_le"
-    //   per-frame rgb   = {"file":"rgb/NNNNNN.jpg"}
-    //   per-frame depth = {"file":"depth/NNNNNN.bin"}
+    // session.json — compact, metadata-only (no frame data array):
+    //   { "sfz_version":"2.0", "session_id":"...", "start_time_utc":"...", "device":{...},
+    //     "actual_fps":57, "frame_count":998,
+    //     "rgb":{"width":W,"height":H,"encoding":"hevc_mp4","file":"rgb.mp4"},
+    //     "depth":{"width":W,"height":H,"encoding":"lz4_raw_float32","file":"depth.bin",
+    //              "units":"meters","sensor":"arkit_lidar"} }
     //
-    // Version "1.1" (iOS native HEVC):
-    //   channels.rgb.format   = "hevc_mp4",   channels.rgb.file   = "rgb.mp4"
-    //   channels.depth.format = "hevc_bgra_float16", channels.depth.file = "depth.mp4"
-    //   per-frame rgb   = {"file":"rgb.mp4","frame_index":N}
-    //   per-frame depth = {"file":"depth.mp4","frame_index":N}
+    // frames.jsonl — one compact JSON line per frame:
+    //   {"frame":0,"ts":1234567890,"pos":[x,y,z],"rot":[x,y,z,w],
+    //    "fx":1500,"fy":1500,"cx":960,"cy":720,"depth_off":0,"depth_sz":12345}
     //
-    // Single-file: pass parts = null → no "parts" key is emitted.
-    // Multi-part:  pass the partition plan → "parts" array is written into part 0's JSON.
+    // depth_off / depth_sz are byte offsets/sizes into depth.bin.
+    // If a frame has no depth, depth_sz == 0 and depth_off points past the last byte.
     internal static class SfzSerializer
     {
-        public static byte[] BuildSessionJson(
-            SfzSessionMetadata meta,
-            List<SfzFrameRecord> frames,
-            SfzPartPlan[] parts,
-            bool isNativePath = false)
+        // ── session.json ──────────────────────────────────────────────────────
+
+        public static byte[] BuildSessionJson(SfzSessionMetadata meta)
         {
-            string version = isNativePath ? "1.1" : "1.0";
-
-            var sb = new StringBuilder(512 + frames.Count * 160);
+            var sb = new StringBuilder(512);
             sb.Append("{\n");
+            AppendStr(sb, "sfz_version",    "2.0",              1, true);
+            AppendStr(sb, "session_id",     meta.SessionId,     1, true);
+            AppendStr(sb, "start_time_utc", meta.StartTimeUtc,  1, true);
 
-            // ── Top-level scalars ────────────────────────────────────────────
-            AppendStr(sb, "version",        version,           1, true);
-            AppendStr(sb, "session_id",     meta.SessionId,    1, true);
-            AppendStr(sb, "start_time_utc", meta.StartTimeUtc, 1, true);
+            sb.Append("  \"device\": {\n");
+            AppendStr(sb, "model",        meta.DeviceModel,  2, true);
+            AppendStr(sb, "os",           meta.DeviceOs,     2, true);
+            AppendStr(sb, "ar_framework", meta.ArFramework,  2, false);
+            sb.Append("  },\n");
 
-            // ── device ───────────────────────────────────────────────────────
-            sb.Append(I(1)).Append("\"device\": {\n");
-            AppendStr(sb, "model",        meta.DeviceModel,   2, true);
-            AppendStr(sb, "os",           meta.DeviceOs,      2, true);
-            AppendStr(sb, "ar_framework", meta.ArFramework,   2, false);
-            sb.Append(I(1)).Append("},\n");
+            AppendInt(sb, "actual_fps",   meta.Fps,          1, true);
+            AppendInt(sb, "frame_count",  meta.FrameCount,   1, true);
 
-            // ── parts (multi-part only) ──────────────────────────────────────
-            if (parts != null && parts.Length > 0)
-            {
-                sb.Append(I(1)).Append("\"parts\": [\n");
-                for (int p = 0; p < parts.Length; p++)
-                {
-                    var part = parts[p];
-                    sb.Append(I(2)).Append("{\n");
-                    AppendStr(sb, "file", part.FileName, 3, true);
-                    sb.Append(I(3)).Append("\"contents\": [\n");
-
-                    bool isFirstPart = p == 0;
-
-                    if (isFirstPart)
-                    {
-                        sb.Append(I(4)).Append("{ \"type\": \"session\" }");
-                        if (part.FrameEnd > part.FrameStart) sb.Append(',');
-                        sb.Append('\n');
-                    }
-
-                    if (part.FrameEnd > part.FrameStart)
-                    {
-                        sb.Append(I(4))
-                          .Append("{ \"type\": \"frames\", \"frame_range\": [")
-                          .Append(part.FrameStart)
-                          .Append(", ")
-                          .Append(part.FrameEnd)
-                          .Append("] }\n");
-                    }
-
-                    sb.Append(I(3)).Append("]\n");
-                    sb.Append(I(2)).Append('}');
-                    if (p < parts.Length - 1) sb.Append(',');
-                    sb.Append('\n');
-                }
-                sb.Append(I(1)).Append("],\n");
-            }
-
-            // ── tracks ───────────────────────────────────────────────────────
-            sb.Append(I(1)).Append("\"tracks\": {\n");
-            sb.Append(I(2)).Append("\"frames\": {\n");
-
-            // metadata
-            sb.Append(I(3)).Append("\"metadata\": {\n");
-            AppendInt(sb, "fps", meta.Fps, 4, true);
-            sb.Append(I(4)).Append("\"channels\": {\n");
-
-            bool rgbTrailing = meta.HasDepth;
             if (meta.HasRgb)
             {
-                sb.Append(I(5)).Append("\"rgb\": {\n");
-                AppendInt(sb, "width",  meta.RgbWidth,  6, true);
-                AppendInt(sb, "height", meta.RgbHeight, 6, true);
-                if (isNativePath)
-                {
-                    AppendStr(sb, "format", "hevc_mp4", 6, true);
-                    AppendStr(sb, "file",   "rgb.mp4",  6, false);
-                }
-                else
-                {
-                    AppendStr(sb, "format", "jpeg", 6, false);
-                }
-                sb.Append(I(5)).Append('}');
-                if (rgbTrailing) sb.Append(',');
+                sb.Append("  \"rgb\": {\n");
+                AppendInt(sb, "width",    meta.RgbWidth,     2, true);
+                AppendInt(sb, "height",   meta.RgbHeight,    2, true);
+                AppendStr(sb, "encoding", "hevc_mp4",        2, true);
+                AppendStr(sb, "file",     "rgb.mp4",         2, false);
+                sb.Append("  }");
+                if (meta.HasDepth) sb.Append(',');
                 sb.Append('\n');
             }
 
             if (meta.HasDepth)
             {
-                sb.Append(I(5)).Append("\"depth\": {\n");
-                AppendInt(sb, "width",  meta.DepthWidth,  6, true);
-                AppendInt(sb, "height", meta.DepthHeight, 6, true);
-                if (isNativePath)
-                {
-                    AppendStr(sb, "format", "hevc_bgra_float16", 6, true);
-                    AppendStr(sb, "file",   "depth.mp4",         6, true);
-                }
-                else
-                {
-                    AppendStr(sb, "format", "raw_float32_le", 6, true);
-                }
-                AppendStr(sb, "units",  "meters",         6, true);
-                AppendStr(sb, "sensor", meta.DepthSensor ?? "arcore_environment_depth", 6, true);
-                AppendDbl(sb, "invalid_value", 0.0,       6, false);
-                sb.Append(I(5)).Append("}\n");
+                sb.Append("  \"depth\": {\n");
+                AppendInt(sb, "width",    meta.DepthWidth,   2, true);
+                AppendInt(sb, "height",   meta.DepthHeight,  2, true);
+                AppendStr(sb, "encoding", "lz4_raw_float32", 2, true);
+                AppendStr(sb, "file",     "depth.bin",       2, true);
+                AppendStr(sb, "units",    "meters",          2, true);
+                AppendStr(sb, "sensor",
+                    meta.DepthSensor ?? "arcore_environment_depth", 2, false);
+                sb.Append("  }\n");
             }
 
-            sb.Append(I(4)).Append("}\n");   // channels
-            sb.Append(I(3)).Append("},\n");  // metadata
+            sb.Append("}\n");
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
 
-            // data array
-            sb.Append(I(3)).Append("\"data\": [\n");
+        // ── frames.jsonl ──────────────────────────────────────────────────────
+
+        // depthSizes[i] is the LZ4-compressed byte count for frame i (0 if no depth).
+        public static byte[] BuildFramesJsonl(List<SfzFrameRecord> frames, int[] depthSizes)
+        {
+            var sb = new StringBuilder(frames.Count * 140);
+            long depthOffset = 0L;
+
             for (int i = 0; i < frames.Count; i++)
             {
-                var f = frames[i];
-                AppendFrameRecord(sb, f, 4, isNativePath);
-                if (i < frames.Count - 1) sb.Append(',');
-                sb.Append('\n');
-            }
-            sb.Append(I(3)).Append("]\n");   // data
+                var  f    = frames[i];
+                int  dsz  = (depthSizes != null && i < depthSizes.Length) ? depthSizes[i] : 0;
 
-            sb.Append(I(2)).Append("}\n");   // frames
-            sb.Append(I(1)).Append("}\n");   // tracks
-            sb.Append("}\n");                // root
+                sb.Append("{\"frame\":").Append(f.FrameIndex);
+                sb.Append(",\"ts\":").Append(f.TimestampNs);
+
+                sb.Append(",\"pos\":[")
+                  .Append(F(f.Position.x)).Append(',')
+                  .Append(F(f.Position.y)).Append(',')
+                  .Append(F(f.Position.z))
+                  .Append(']');
+
+                sb.Append(",\"rot\":[")
+                  .Append(F(f.Rotation.x)).Append(',')
+                  .Append(F(f.Rotation.y)).Append(',')
+                  .Append(F(f.Rotation.z)).Append(',')
+                  .Append(F(f.Rotation.w))
+                  .Append(']');
+
+                if (f.HasIntrinsics)
+                {
+                    sb.Append(",\"fx\":").Append(F(f.Fx));
+                    sb.Append(",\"fy\":").Append(F(f.Fy));
+                    sb.Append(",\"cx\":").Append(F(f.Cx));
+                    sb.Append(",\"cy\":").Append(F(f.Cy));
+                }
+
+                sb.Append(",\"depth_off\":").Append(depthOffset);
+                sb.Append(",\"depth_sz\":").Append(dsz);
+                sb.Append("}\n");
+
+                depthOffset += dsz;
+            }
 
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
-        // ── Frame record ─────────────────────────────────────────────────────
-
-        static void AppendFrameRecord(StringBuilder sb, SfzFrameRecord f, int indent, bool isNativePath)
-        {
-            sb.Append(I(indent)).Append('{');
-            sb.Append("\"timestamp_ns\":").Append(f.TimestampNs).Append(',');
-
-            // camera
-            sb.Append("\"camera\":{");
-            sb.Append("\"pose\":{");
-            sb.Append("\"position\":[");
-            sb.Append(F(f.Position.x)).Append(',')
-              .Append(F(f.Position.y)).Append(',')
-              .Append(F(f.Position.z));
-            sb.Append("],\"rotation\":[");
-            sb.Append(F(f.Rotation.x)).Append(',')
-              .Append(F(f.Rotation.y)).Append(',')
-              .Append(F(f.Rotation.z)).Append(',')
-              .Append(F(f.Rotation.w));
-            sb.Append("]}");
-
-            if (f.HasIntrinsics)
-            {
-                sb.Append(",\"intrinsics\":{");
-                sb.Append("\"fx\":").Append(F(f.Fx)).Append(',');
-                sb.Append("\"fy\":").Append(F(f.Fy)).Append(',');
-                sb.Append("\"cx\":").Append(F(f.Cx)).Append(',');
-                sb.Append("\"cy\":").Append(F(f.Cy));
-                sb.Append('}');
-            }
-
-            sb.Append('}');  // camera
-
-            if (f.HasColor)
-            {
-                if (isNativePath)
-                {
-                    sb.Append(",\"rgb\":{\"file\":\"rgb.mp4\",\"frame_index\":")
-                      .Append(f.FrameIndex)
-                      .Append('}');
-                }
-                else
-                {
-                    string file = "rgb/" + f.FrameIndex.ToString("D6") + ".jpg";
-                    sb.Append(",\"rgb\":{\"file\":\"").Append(file).Append("\"}");
-                }
-            }
-
-            if (f.HasDepth)
-            {
-                if (isNativePath)
-                {
-                    sb.Append(",\"depth\":{\"file\":\"depth.mp4\",\"frame_index\":")
-                      .Append(f.FrameIndex)
-                      .Append('}');
-                }
-                else
-                {
-                    string file = "depth/" + f.FrameIndex.ToString("D6") + ".bin";
-                    sb.Append(",\"depth\":{\"file\":\"").Append(file).Append("\"}");
-                }
-            }
-
-            sb.Append('}');
-        }
-
-        // ── Helpers ───────────────────────────────────────────────────────────
+        // ── Helpers ────────────────────────────────────────────────────────────
 
         static void AppendStr(StringBuilder sb, string key, string value, int indent, bool comma)
         {
-            sb.Append(I(indent)).Append('"').Append(key).Append("\": \"");
+            sb.Append(indent == 2 ? "    " : "  ")
+              .Append('"').Append(key).Append("\": \"");
             AppendEscaped(sb, value ?? string.Empty);
             sb.Append('"');
             if (comma) sb.Append(',');
@@ -232,15 +130,8 @@ namespace SensorFlex.Recorder
 
         static void AppendInt(StringBuilder sb, string key, int value, int indent, bool comma)
         {
-            sb.Append(I(indent)).Append('"').Append(key).Append("\": ").Append(value);
-            if (comma) sb.Append(',');
-            sb.Append('\n');
-        }
-
-        static void AppendDbl(StringBuilder sb, string key, double value, int indent, bool comma)
-        {
-            sb.Append(I(indent)).Append('"').Append(key).Append("\": ")
-              .Append(value.ToString("0.################", CultureInfo.InvariantCulture));
+            sb.Append(indent == 2 ? "    " : "  ")
+              .Append('"').Append(key).Append("\": ").Append(value);
             if (comma) sb.Append(',');
             sb.Append('\n');
         }
@@ -263,16 +154,5 @@ namespace SensorFlex.Recorder
 
         // 9 significant digits preserves float32 values exactly on round-trip.
         static string F(float v) => v.ToString("G9", CultureInfo.InvariantCulture);
-
-        static string I(int level) => level switch
-        {
-            1 => "  ",
-            2 => "    ",
-            3 => "      ",
-            4 => "        ",
-            5 => "          ",
-            6 => "            ",
-            _ => new string(' ', level * 2)
-        };
     }
 }
