@@ -42,11 +42,12 @@ namespace SensorFlex.Recorder
 
             if (meta.HasRgb)
             {
+                string rgbEncoding = meta.RgbCodec == SfzRgbCodec.H264 ? "h264_mp4" : "hevc_mp4";
                 sb.Append("  \"rgb\": {\n");
-                AppendInt(sb, "width",    meta.RgbWidth,     2, true);
-                AppendInt(sb, "height",   meta.RgbHeight,    2, true);
-                AppendStr(sb, "encoding", "hevc_mp4",        2, true);
-                AppendStr(sb, "file",     "rgb.mp4",         2, false);
+                AppendInt(sb, "width",    meta.RgbWidth,  2, true);
+                AppendInt(sb, "height",   meta.RgbHeight, 2, true);
+                AppendStr(sb, "encoding", rgbEncoding,    2, true);
+                AppendStr(sb, "file",     "rgb.mp4",      2, false);
                 sb.Append("  }");
                 if (meta.HasDepth) sb.Append(',');
                 sb.Append('\n');
@@ -54,12 +55,43 @@ namespace SensorFlex.Recorder
 
             if (meta.HasDepth)
             {
+                string depthEncoding;
+                string depthFile;
+                bool   emitDepthMax = false;
+                switch (meta.DepthCodec)
+                {
+                    case SfzDepthCodec.HEVC:
+#if UNITY_IOS
+                        depthEncoding = "hevc_float16";
+#else
+                        depthEncoding = "hevc_uint8_norm";
+                        emitDepthMax  = true;
+#endif
+                        depthFile = "depth.mp4";
+                        break;
+                    case SfzDepthCodec.H264:
+                        depthEncoding = "h264_uint8_norm";
+                        depthFile     = "depth.mp4";
+                        emitDepthMax  = true;
+                        break;
+                    case SfzDepthCodec.Zstd:
+                        depthEncoding = "zstd_float32";
+                        depthFile     = "depth.bin";
+                        break;
+                    default: // LZ4
+                        depthEncoding = "lz4_float32";
+                        depthFile     = "depth.bin";
+                        break;
+                }
+
                 sb.Append("  \"depth\": {\n");
-                AppendInt(sb, "width",    meta.DepthWidth,   2, true);
-                AppendInt(sb, "height",   meta.DepthHeight,  2, true);
-                AppendStr(sb, "encoding", "lz4_raw_float32", 2, true);
-                AppendStr(sb, "file",     "depth.bin",       2, true);
-                AppendStr(sb, "units",    "meters",          2, true);
+                AppendInt(sb, "width",    meta.DepthWidth,  2, true);
+                AppendInt(sb, "height",   meta.DepthHeight, 2, true);
+                AppendStr(sb, "encoding", depthEncoding,    2, true);
+                AppendStr(sb, "file",     depthFile,        2, true);
+                if (emitDepthMax)
+                    AppendFloat(sb, "depth_max_meters", meta.DepthMaxMeters, 2, true);
+                AppendStr(sb, "units",  "meters", 2, true);
                 AppendStr(sb, "sensor",
                     meta.DepthSensor ?? "arcore_environment_depth", 2, false);
                 sb.Append("  }\n");
@@ -72,15 +104,21 @@ namespace SensorFlex.Recorder
         // ── frames.jsonl ──────────────────────────────────────────────────────
 
         // depthSizes[i] is the LZ4-compressed byte count for frame i (0 if no depth).
-        public static byte[] BuildFramesJsonl(List<SfzFrameRecord> frames, int[] depthSizes)
+        // For video depth codecs (HEVC/H264), depthSizes is null and a running
+        // depth_frame counter is emitted instead of depth_off/depth_sz.
+        public static byte[] BuildFramesJsonl(List<SfzFrameRecord> frames, int[] depthSizes,
+                                               SfzDepthCodec depthCodec)
         {
+            bool isVideoDepth = depthCodec != SfzDepthCodec.LZ4;
             var sb = new StringBuilder(frames.Count * 140);
-            long depthOffset = 0L;
+            long depthOffset  = 0L;
+            int  depthFrameN  = 0;
 
             for (int i = 0; i < frames.Count; i++)
             {
-                var  f    = frames[i];
-                int  dsz  = (depthSizes != null && i < depthSizes.Length) ? depthSizes[i] : 0;
+                var f   = frames[i];
+                int dsz = (!isVideoDepth && depthSizes != null && i < depthSizes.Length)
+                    ? depthSizes[i] : 0;
 
                 sb.Append("{\"frame\":").Append(f.FrameIndex);
                 sb.Append(",\"ts\":").Append(f.TimestampNs);
@@ -106,11 +144,19 @@ namespace SensorFlex.Recorder
                     sb.Append(",\"cy\":").Append(F(f.Cy));
                 }
 
-                sb.Append(",\"depth_off\":").Append(depthOffset);
-                sb.Append(",\"depth_sz\":").Append(dsz);
-                sb.Append("}\n");
+                if (isVideoDepth)
+                {
+                    sb.Append(",\"depth_frame\":").Append(depthFrameN);
+                    if (f.HasDepth) depthFrameN++;
+                }
+                else
+                {
+                    sb.Append(",\"depth_off\":").Append(depthOffset);
+                    sb.Append(",\"depth_sz\":").Append(dsz);
+                    depthOffset += dsz;
+                }
 
-                depthOffset += dsz;
+                sb.Append("}\n");
             }
 
             return Encoding.UTF8.GetBytes(sb.ToString());
@@ -132,6 +178,14 @@ namespace SensorFlex.Recorder
         {
             sb.Append(indent == 2 ? "    " : "  ")
               .Append('"').Append(key).Append("\": ").Append(value);
+            if (comma) sb.Append(',');
+            sb.Append('\n');
+        }
+
+        static void AppendFloat(StringBuilder sb, string key, float value, int indent, bool comma)
+        {
+            sb.Append(indent == 2 ? "    " : "  ")
+              .Append('"').Append(key).Append("\": ").Append(F(value));
             if (comma) sb.Append(',');
             sb.Append('\n');
         }

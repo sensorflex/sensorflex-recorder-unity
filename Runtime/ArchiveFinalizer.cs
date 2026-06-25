@@ -50,25 +50,34 @@ namespace SensorFlex.Recorder
 
             Directory.CreateDirectory(outputDir);
 
-            // ── Read depth compressed sizes ────────────────────────────────
-            string depthSizesPath = Path.Combine(tempDir, "depth_sizes.bin");
-            int[]  depthSizes     = ReadDepthSizes(depthSizesPath, frameRecords.Count);
+            bool isVideoDepth = meta.DepthCodec == SfzDepthCodec.HEVC || meta.DepthCodec == SfzDepthCodec.H264;
+
+            // ── Read depth compressed sizes (LZ4 only) ─────────────────────
+            int[] depthSizes = null;
+            if (!isVideoDepth)
+            {
+                string depthSizesPath = Path.Combine(tempDir, "depth_sizes.bin");
+                depthSizes = ReadDepthSizes(depthSizesPath, frameRecords.Count);
+            }
 
             // ── Build text files ───────────────────────────────────────────
-            byte[] sessionJsonBytes  = SfzSerializer.BuildSessionJson(meta);
-            byte[] framesJsonlBytes  = SfzSerializer.BuildFramesJsonl(frameRecords, depthSizes);
+            byte[] sessionJsonBytes = SfzSerializer.BuildSessionJson(meta);
+            byte[] framesJsonlBytes = SfzSerializer.BuildFramesJsonl(frameRecords, depthSizes, meta.DepthCodec);
 
             // ── Write SFZ archive ──────────────────────────────────────────
-            string outPath  = Path.Combine(outputDir, meta.SessionId + ".sfz");
+            string outPath = Path.Combine(outputDir, meta.SessionId + ".sfz");
             if (File.Exists(outPath)) File.Delete(outPath);
 
             using (var zipStream = new FileStream(outPath, FileMode.Create, FileAccess.Write))
             using (var archive   = new ZipArchive(zipStream, ZipArchiveMode.Create))
             {
-                WriteBytes(archive, "session/session.json",  sessionJsonBytes, SysCompressionLevel.Optimal);
-                WriteBytes(archive, "session/frames.jsonl",  framesJsonlBytes, SysCompressionLevel.Optimal);
-                CopyFile(archive, "session/rgb.mp4",   Path.Combine(tempDir, "rgb.mp4"),   SysCompressionLevel.NoCompression);
-                CopyFile(archive, "session/depth.bin", Path.Combine(tempDir, "depth.bin"), SysCompressionLevel.NoCompression);
+                WriteBytes(archive, "session/session.json", sessionJsonBytes, SysCompressionLevel.Optimal);
+                WriteBytes(archive, "session/frames.jsonl", framesJsonlBytes, SysCompressionLevel.Optimal);
+                CopyFile(archive, "session/rgb.mp4", Path.Combine(tempDir, "rgb.mp4"), SysCompressionLevel.NoCompression);
+                if (isVideoDepth)
+                    CopyFile(archive, "session/depth.mp4", Path.Combine(tempDir, "depth.mp4"), SysCompressionLevel.NoCompression);
+                else
+                    CopyFile(archive, "session/depth.bin", Path.Combine(tempDir, "depth.bin"), SysCompressionLevel.NoCompression);
             }
 
             long kb = new FileInfo(outPath).Length / 1024;
