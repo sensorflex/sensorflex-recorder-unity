@@ -163,7 +163,7 @@ int32_t SFDepthLz4_AppendFrame(void *pF32, int32_t stride,
         void  *dst    = malloc(maxDst);
         size_t compLen = 0;
         if (dst)
-            compLen = compression_encode_buffer(dst, maxDst,
+            compLen = compression_encode_buffer((uint8_t *)dst, maxDst,
                                                 (const uint8_t *)buf, srcSize,
                                                 NULL, COMPRESSION_LZ4_RAW);
         free(buf);
