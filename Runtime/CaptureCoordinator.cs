@@ -165,8 +165,11 @@ namespace SensorFlex.Recorder
                 _cameraManager.frameReceived -= OnCameraFrameReceived;
 
 #if UNITY_IOS && !UNITY_EDITOR
-            if (_nativeRgbStarted)      NativeVideoEncoder.FinishRgbSession();
-            if (_nativeDepthLz4Started) NativeVideoEncoder.FinishDepthLz4Session();
+            if (_nativeRgbStarted) NativeVideoEncoder.FinishRgbSession();
+            // Always call FinishDepthLz4Session — native side handles the no-op case
+            // (gDepthQueue == NULL → immediate callback). Without this, _depthDone is
+            // never set when depth was never acquired, causing WaitForBothFinished to hang.
+            NativeVideoEncoder.FinishDepthLz4Session();
 #endif
 
             SessionMetadata = new SfzSessionMetadata

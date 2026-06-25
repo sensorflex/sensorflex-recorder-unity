@@ -56,6 +56,7 @@ namespace SensorFlex.Recorder
         public static void StartRgbSession(string mp4Path, int width, int height)
         {
             _rgbDone.Reset();
+            _depthDone.Reset();  // Reset at session start so WaitForBothFinished works even if depth never starts
             SFRgbEncoder_Start(mp4Path, width, height);
         }
 
