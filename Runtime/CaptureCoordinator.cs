@@ -24,17 +24,43 @@ namespace SensorFlex.Recorder
         // ── Public state ───────────────────────────────────────────────────
 
         public string                TempDir         { get; }
+        public string                SessionId       { get; }
         public SfzSessionMetadata    SessionMetadata { get; private set; }
         public List<SfzFrameRecord>  FrameRecords    { get; } = new List<SfzFrameRecord>(4096);
 
         // Set to true when the max recording duration is reached.
         public bool LimitReached { get; private set; }
 
+        // true after BeginStandby() has detected image dimensions from ARKit.
+        public bool HasDims { get; private set; }
+
+        // true after StartEngines() has been called.
+        public bool EnginesStarted { get; private set; }
+
+        // true when the async native encoder setup is complete and Begin() can be called with zero drops.
+        public bool IsEncoderReady
+        {
+            get
+            {
+                if (!EnginesStarted) return false;
+#if UNITY_IOS && !UNITY_EDITOR
+                bool isVideoDepth = _captureDepthEnabled &&
+                    _depthCodecInt != (int)SfzDepthCodec.LZ4 &&
+                    _depthCodecInt != (int)SfzDepthCodec.Zstd;
+                return NativeVideoEncoder.IsRgbReady &&
+                       (!isVideoDepth || NativeVideoEncoder.IsDepthVideoReady);
+#else
+                return true;
+#endif
+            }
+        }
+
         // ── Derived paths ──────────────────────────────────────────────────
 
         public string RgbMp4Path     => Path.Combine(TempDir, "rgb.mp4");
         public string DepthBinPath   => Path.Combine(TempDir, "depth.bin");
         public string DepthSizesPath => Path.Combine(TempDir, "depth_sizes.bin");
+        public string DepthMp4Path   => Path.Combine(TempDir, "depth.mp4");
 
         // ── Private fields ─────────────────────────────────────────────────
 
@@ -43,9 +69,10 @@ namespace SensorFlex.Recorder
         AROcclusionManager _occlusionManager;
         Camera            _mainCamera;
 
-        int  _frameIndex;
-        bool _isCapturing;
-        bool _captureDepthEnabled;
+        int   _frameIndex;
+        bool  _isCapturing;
+        bool  _captureDepthEnabled;
+        int   _depthCodecInt;  // cast of SfzDepthCodec, avoids cross-file type reference at field site
 
         bool   _hasFirstColorDims;
         int    _firstColorW, _firstColorH;
@@ -61,6 +88,7 @@ namespace SensorFlex.Recorder
 
         long _maxDurationNs;
 
+        bool _standbySubscribed;   // prevents double-subscription in BeginStandby()
         bool _warnedDropped;
         bool _warnedMissingIntrinsics;
         bool _warnedMissingDepth;
@@ -68,6 +96,7 @@ namespace SensorFlex.Recorder
 #if UNITY_IOS && !UNITY_EDITOR
         bool _nativeRgbStarted;
         bool _nativeDepthLz4Started;
+        bool _nativeDepthVideoStarted;
         bool _warnedRgbNotReady;
         bool _warnedDepthNotReady;
 #endif
@@ -76,13 +105,169 @@ namespace SensorFlex.Recorder
 
         // ── Constructor ────────────────────────────────────────────────────
 
-        public CaptureCoordinator(ARSensorFlexRecorder config, string tempDir)
+        public CaptureCoordinator(ARSensorFlexRecorder config, string tempDir, string sessionId)
         {
-            _config = config;
-            TempDir = tempDir;
+            _config   = config;
+            TempDir   = tempDir;
+            SessionId = sessionId;
         }
 
         // ── Lifecycle ──────────────────────────────────────────────────────
+
+        // Phase 1 of pre-warm: set up managers + subscribe to one ARKit frame to
+        // detect image dimensions. Returns false if the camera subsystem is not
+        // yet running (caller should retry next Update frame).
+        public bool BeginStandby()
+        {
+            if (HasDims || EnginesStarted || _isCapturing) return true;
+
+            var origin = _config.GetComponent<XROrigin>();
+            _mainCamera = origin != null ? origin.Camera : Camera.main;
+            if (_mainCamera == null) return false;
+
+            _cameraManager    = _mainCamera.GetComponent<ARCameraManager>();
+            _occlusionManager = _mainCamera.GetComponent<AROcclusionManager>();
+
+            if (_cameraManager == null ||
+                _cameraManager.subsystem == null ||
+                !_cameraManager.subsystem.running)
+                return false;
+
+            _depthCodecInt       = (int)_config.DepthCodec;
+            _captureDepthEnabled = _config.CaptureDepth;
+            if (_captureDepthEnabled &&
+                (_occlusionManager == null || _occlusionManager.subsystem == null))
+                _captureDepthEnabled = false;
+
+            Directory.CreateDirectory(TempDir);
+            if (!_standbySubscribed)
+            {
+                _standbySubscribed = true;
+                _cameraManager.frameReceived += OnStandbyFrameReceived;
+            }
+            return true;
+        }
+
+        // Phase 2: start native encoder sessions with the pre-detected dimensions.
+        // Must only be called after the previous session's WaitForBothFinished has
+        // completed (static NativeVideoEncoder state must be free).
+        public void StartEngines()
+        {
+            if (EnginesStarted || !HasDims) return;
+            EnginesStarted = true;
+
+#if UNITY_IOS && !UNITY_EDITOR
+            if (_config.CaptureColor && _firstColorW > 0)
+            {
+                NativeVideoEncoder.StartRgbSession(
+                    RgbMp4Path, _firstColorW, _firstColorH, _config.RgbCodec);
+                _nativeRgbStarted = true;
+            }
+
+            bool isVideoDepth = _captureDepthEnabled &&
+                _depthCodecInt != (int)SfzDepthCodec.LZ4 &&
+                _depthCodecInt != (int)SfzDepthCodec.Zstd;
+            if (isVideoDepth && _firstDepthW > 0)
+            {
+                NativeVideoEncoder.StartDepthVideoSession(
+                    DepthMp4Path, _firstDepthW, _firstDepthH,
+                    _config.DepthCodec, _config.DepthMaxMeters);
+                _nativeDepthVideoStarted = true;
+            }
+#else
+            // Non-iOS: nothing to pre-start; IsEncoderReady returns true immediately.
+#endif
+        }
+
+        // Phase 3: called when the user presses Start. Resets per-session counters
+        // and enables frame recording. Encoders must be started (via StartCapture or
+        // StartEngines) before this.
+        public void Begin()
+        {
+            if (_isCapturing) return;
+
+            _frameIndex              = 0;
+            _hasValidIntrinsics      = false;
+            _warnedDropped           = false;
+            _warnedMissingIntrinsics = false;
+            _warnedMissingDepth      = false;
+            _firstTimestampNs        = 0;
+            _lastTimestampNs         = 0;
+            LimitReached             = false;
+            _maxDurationNs           = _config.MaxRecordingSeconds > 0
+                                         ? (long)(_config.MaxRecordingSeconds * 1_000_000_000.0)
+                                         : 0L;
+            FrameRecords.Clear();
+
+#if UNITY_IOS && !UNITY_EDITOR
+            _warnedRgbNotReady   = false;
+            _warnedDepthNotReady = false;
+#endif
+
+            if (_captureDepthEnabled && _occlusionManager != null)
+                ConfigureDepthMode();
+
+            _cameraManager.frameReceived += OnCameraFrameReceived;
+            _isCapturing = true;
+
+            Debug.Log($"[SF-Recorder] Recording begun (pre-warmed={EnginesStarted}). TempDir='{TempDir}'");
+        }
+
+        // Standby dim-detection callback. Retries next frame if depth is not yet available.
+        void OnStandbyFrameReceived(ARCameraFrameEventArgs _)
+        {
+            _cameraManager.frameReceived -= OnStandbyFrameReceived;
+
+            bool colorDone = !_config.CaptureColor;
+            bool depthDone = !_captureDepthEnabled;
+
+#if UNITY_IOS && !UNITY_EDITOR
+            if (_config.CaptureColor &&
+                _cameraManager.TryAcquireLatestCpuImage(out var colorImg))
+            {
+                _firstColorW       = colorImg.width;
+                _firstColorH       = colorImg.height;
+                _hasFirstColorDims = true;
+                colorImg.Dispose();
+                colorDone = true;
+            }
+
+            bool isVideoDepth = _captureDepthEnabled &&
+                _depthCodecInt != (int)SfzDepthCodec.LZ4 &&
+                _depthCodecInt != (int)SfzDepthCodec.Zstd;
+
+            if (_captureDepthEnabled)
+            {
+                if (!isVideoDepth)
+                {
+                    depthDone = true; // LZ4/Zstd: dims detected on first recording frame; no pre-warm needed
+                }
+                else if (_occlusionManager != null &&
+                         _occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImg))
+                {
+                    _firstDepthW       = depthImg.width;
+                    _firstDepthH       = depthImg.height;
+                    _hasFirstDepthDims = true;
+                    _depthSensor       = "arkit_lidar";
+                    depthImg.Dispose();
+                    depthDone = true;
+                }
+            }
+#else
+            colorDone = true;
+            depthDone = true;
+#endif
+
+            if (colorDone && depthDone)
+            {
+                HasDims = true;
+            }
+            else
+            {
+                // ARKit depth not ready yet on this frame — retry next frame.
+                _cameraManager.frameReceived += OnStandbyFrameReceived;
+            }
+        }
 
         public bool StartCapture()
         {
@@ -112,6 +297,7 @@ namespace SensorFlex.Recorder
                 return false;
             }
 
+            _depthCodecInt       = (int)_config.DepthCodec;
             _captureDepthEnabled = _config.CaptureDepth;
             if (_captureDepthEnabled)
             {
@@ -142,10 +328,11 @@ namespace SensorFlex.Recorder
             FrameRecords.Clear();
 
 #if UNITY_IOS && !UNITY_EDITOR
-            _nativeRgbStarted     = false;
-            _nativeDepthLz4Started = false;
-            _warnedRgbNotReady    = false;
-            _warnedDepthNotReady  = false;
+            _nativeRgbStarted       = false;
+            _nativeDepthLz4Started  = false;
+            _nativeDepthVideoStarted = false;
+            _warnedRgbNotReady      = false;
+            _warnedDepthNotReady    = false;
 #endif
 
             Directory.CreateDirectory(TempDir);
@@ -166,34 +353,44 @@ namespace SensorFlex.Recorder
 
 #if UNITY_IOS && !UNITY_EDITOR
             if (_nativeRgbStarted) NativeVideoEncoder.FinishRgbSession();
-            // Always call FinishDepthLz4Session — native side handles the no-op case
-            // (gDepthQueue == NULL → immediate callback). Without this, _depthDone is
-            // never set when depth was never acquired, causing WaitForBothFinished to hang.
-            NativeVideoEncoder.FinishDepthLz4Session();
+            // FinishDepthSession dispatches to LZ4, video, or no-op based on what was started.
+            NativeVideoEncoder.FinishDepthSession();
 #endif
 
             SessionMetadata = new SfzSessionMetadata
             {
-                SessionId    = _config.SessionId,
-                StartTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
-                DeviceModel  = SystemInfo.deviceModel,
-                DeviceOs     = SystemInfo.operatingSystem,
-                ArFramework  = ResolveCaptureFramework(),
-                Fps          = ComputeActualFps(),
-                FrameCount   = FrameRecords.Count,
-                HasRgb       = _hasFirstColorDims,
-                RgbWidth     = _firstColorW,
-                RgbHeight    = _firstColorH,
-                HasDepth     = _hasFirstDepthDims,
-                DepthWidth   = _firstDepthW,
-                DepthHeight  = _firstDepthH,
-                DepthSensor  = _depthSensor,
+                SessionId      = SessionId,
+                StartTimeUtc   = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                DeviceModel    = SystemInfo.deviceModel,
+                DeviceOs       = SystemInfo.operatingSystem,
+                ArFramework    = ResolveCaptureFramework(),
+                Fps            = ComputeActualFps(),
+                FrameCount     = FrameRecords.Count,
+                HasRgb         = _hasFirstColorDims,
+                RgbWidth       = _firstColorW,
+                RgbHeight      = _firstColorH,
+                HasDepth       = _hasFirstDepthDims,
+                DepthWidth     = _firstDepthW,
+                DepthHeight    = _firstDepthH,
+                DepthSensor    = _depthSensor,
+                RgbCodec       = _config.RgbCodec,
+                DepthCodec     = _config.DepthCodec,
+                DepthMaxMeters = _config.DepthMaxMeters,
             };
 
             Debug.Log($"[SF-Recorder] Capture stopped. Frames={FrameRecords.Count} ActualFPS={SessionMetadata.Fps}");
         }
 
-        public void Dispose() => StopCapture();
+        public void Dispose()
+        {
+            // Unsubscribe standby callback if we're disposed mid-scan.
+            if (_standbySubscribed && _cameraManager != null)
+            {
+                _cameraManager.frameReceived -= OnStandbyFrameReceived;
+                _standbySubscribed = false;
+            }
+            StopCapture();
+        }
 
         // ── Frame callback ─────────────────────────────────────────────────
 
@@ -223,7 +420,9 @@ namespace SensorFlex.Recorder
                 hasColor = AcquireAndEncodeColorNative(timestampNs - _firstTimestampNs);
 
             if (_captureDepthEnabled)
-                hasDepth = AcquireAndEncodeDepthLz4();
+                hasDepth = (_depthCodecInt == 0)  // SfzDepthCodec.LZ4 == 0
+                    ? AcquireAndEncodeDepthLz4()
+                    : AcquireAndEncodeDepthVideo(timestampNs - _firstTimestampNs);
 #else
             if (_config.CaptureColor && !_hasFirstColorDims)
                 Debug.LogWarning("[SF-Recorder] RGB recording is only supported on iOS. No frames will be captured on this platform.");
@@ -296,7 +495,7 @@ namespace SensorFlex.Recorder
             {
                 if (!_nativeRgbStarted)
                 {
-                    NativeVideoEncoder.StartRgbSession(RgbMp4Path, cpuImage.width, cpuImage.height);
+                    NativeVideoEncoder.StartRgbSession(RgbMp4Path, cpuImage.width, cpuImage.height, _config.RgbCodec);
                     _firstColorW       = cpuImage.width;
                     _firstColorH       = cpuImage.height;
                     _hasFirstColorDims = true;
@@ -328,6 +527,59 @@ namespace SensorFlex.Recorder
             }
         }
 
+        unsafe bool AcquireAndEncodeDepthVideo(long sessionRelativeNs)
+        {
+            if (!_occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImage))
+            {
+                if (!_warnedMissingDepth)
+                {
+                    Debug.LogWarning(
+                        $"[SF-Recorder] Depth unavailable. " +
+                        $"requested={_occlusionManager.requestedEnvironmentDepthMode} " +
+                        $"current={_occlusionManager.currentEnvironmentDepthMode}");
+                    _warnedMissingDepth = true;
+                }
+                return false;
+            }
+
+            _warnedMissingDepth = false;
+
+            try
+            {
+                if (!_nativeDepthVideoStarted)
+                {
+                    NativeVideoEncoder.StartDepthVideoSession(
+                        DepthMp4Path, depthImage.width, depthImage.height,
+                        _config.DepthCodec, _config.DepthMaxMeters);
+                    _firstDepthW             = depthImage.width;
+                    _firstDepthH             = depthImage.height;
+                    _hasFirstDepthDims       = true;
+                    _nativeDepthVideoStarted = true;
+                    _depthSensor             = "arkit_lidar";
+                }
+
+                var plane  = depthImage.GetPlane(0);
+                void* pF32 = NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(plane.data);
+
+                bool appended = NativeVideoEncoder.AppendDepthVideoFrame(
+                    (IntPtr)pF32, plane.rowStride,
+                    depthImage.width, depthImage.height,
+                    sessionRelativeNs);
+
+                if (!appended && !_warnedDepthNotReady)
+                {
+                    Debug.LogWarning("[SF-Recorder] Depth video encoder not ready — frame dropped.");
+                    _warnedDepthNotReady = true;
+                }
+
+                return appended;
+            }
+            finally
+            {
+                depthImage.Dispose();
+            }
+        }
+
         unsafe bool AcquireAndEncodeDepthLz4()
         {
             if (!_occlusionManager.TryAcquireEnvironmentDepthCpuImage(out var depthImage))
@@ -351,7 +603,8 @@ namespace SensorFlex.Recorder
                 {
                     NativeVideoEncoder.StartDepthLz4Writer(
                         DepthBinPath, DepthSizesPath,
-                        depthImage.width, depthImage.height);
+                        depthImage.width, depthImage.height,
+                        (SfzDepthCodec)_depthCodecInt);
                     _firstDepthW          = depthImage.width;
                     _firstDepthH          = depthImage.height;
                     _hasFirstDepthDims    = true;

@@ -56,6 +56,13 @@ namespace SensorFlex.Recorder
         [Min(0)]
         [SerializeField] int m_MaxRecordingSeconds = 60;
 
+        [Header("Encoding")]
+        [SerializeField] SfzRgbCodec m_RgbCodec = SfzRgbCodec.HEVC;
+        [SerializeField] SfzDepthCodec m_DepthCodec = SfzDepthCodec.LZ4;
+        [Tooltip("Normalisation range for H264 depth (metres). Values beyond this are clamped.")]
+        [Min(0.1f)]
+        [SerializeField] float m_DepthMaxMeters = 10f;
+
         [Header("Controls")]
         [SerializeField] bool m_RecordOnStart;
 
@@ -63,11 +70,17 @@ namespace SensorFlex.Recorder
 
         public bool     IsRecording        { get; private set; }
         public bool     IsFinalizing       { get; private set; }
+        // True when encoders are fully warmed and StartRecording() will begin with zero frame drops.
+        public bool     IsStandby          { get; private set; }
         public string   ActiveSessionId    { get; private set; }
         public string[] LastArchivePaths   { get; private set; }
         public string   LastError          { get; private set; }
 
         // ── Exposed config (read by CaptureCoordinator) ────────────────────
+
+        internal SfzRgbCodec   RgbCodec       => m_RgbCodec;
+        internal SfzDepthCodec DepthCodec     => m_DepthCodec;
+        internal float         DepthMaxMeters => m_DepthMaxMeters;
 
         internal string SessionId           => string.IsNullOrEmpty(m_SessionId)
                                                   ? (ActiveSessionId ?? Guid.NewGuid().ToString("N"))
@@ -84,11 +97,18 @@ namespace SensorFlex.Recorder
         // ── Private ────────────────────────────────────────────────────────
 
         CaptureCoordinator _coordinator;
+        CaptureCoordinator _standbyCoordinator;
         Task<string[]>     _finalizationTask;
         bool               _recordOnStartPending;
         float              _recordOnStartDeadline;
 
         // ── Unity lifecycle ────────────────────────────────────────────────
+
+        void Awake()
+        {
+            NativeVideoEncoder.LogCapabilities(m_RgbCodec, m_DepthCodec);
+            NativeVideoEncoder.PrewarmEncoders();
+        }
 
         void Start()
         {
@@ -97,18 +117,39 @@ namespace SensorFlex.Recorder
                 _recordOnStartPending  = true;
                 _recordOnStartDeadline = Time.realtimeSinceStartup + 5f;
             }
+            PrepareRecording();
         }
 
         void Update()
         {
-            // RecordOnStart: wait until the camera subsystem is running.
+            // Drive standby coordinator state machine.
+            if (_standbyCoordinator != null && !IsStandby && !IsRecording)
+            {
+                // Phase 1: try BeginStandby every frame until camera subsystem is ready.
+                if (!_standbyCoordinator.HasDims)
+                    _standbyCoordinator.BeginStandby();
+
+                // Phase 2: start engines once dims are known and no old finalization is pending
+                // (StartRgbSession resets static ManualResetEvents; must not race WaitForBothFinished).
+                if (_standbyCoordinator.HasDims &&
+                    !_standbyCoordinator.EnginesStarted &&
+                    !IsFinalizing)
+                {
+                    _standbyCoordinator.StartEngines();
+                }
+
+                // Phase 3: transition to Standby when native setup is complete.
+                if (_standbyCoordinator.IsEncoderReady)
+                {
+                    IsStandby = true;
+                    Debug.Log("[SF-Recorder] Encoders ready — on standby.");
+                }
+            }
+
+            // RecordOnStart: wait until standby is ready (or deadline passes) before starting.
             if (_recordOnStartPending && !IsRecording)
             {
-                var origin        = GetComponent<XROrigin>();
-                var camera        = origin != null ? origin.Camera : Camera.main;
-                var cameraManager = camera != null ? camera.GetComponent<ARCameraManager>() : null;
-
-                if (cameraManager != null && cameraManager.subsystem != null && cameraManager.subsystem.running)
+                if (IsStandby)
                 {
                     _recordOnStartPending = false;
                     StartRecording();
@@ -116,7 +157,8 @@ namespace SensorFlex.Recorder
                 else if (Time.realtimeSinceStartup >= _recordOnStartDeadline)
                 {
                     _recordOnStartPending = false;
-                    Debug.LogWarning("[SF-Recorder] RecordOnStart timed out waiting for an active camera subsystem.");
+                    Debug.LogWarning("[SF-Recorder] RecordOnStart timed out waiting for standby — starting cold.");
+                    StartRecording();
                 }
             }
 
@@ -126,6 +168,7 @@ namespace SensorFlex.Recorder
                 IsRecording = false;
                 Debug.Log("[SF-Recorder] Max recording duration reached. Starting finalization.");
                 BeginFinalization();
+                PrepareRecording();
                 RecordingLimitReachedEvent?.Invoke();
             }
 
@@ -155,6 +198,8 @@ namespace SensorFlex.Recorder
         {
             if (IsRecording)
                 StopRecording();
+            _standbyCoordinator?.Dispose();
+            _standbyCoordinator = null;
         }
 
         // ── Public API ─────────────────────────────────────────────────────
@@ -167,7 +212,26 @@ namespace SensorFlex.Recorder
             LastError        = null;
             LastArchivePaths = null;
 
-            // Resolve the session id once so it is stable for the whole session.
+            // Fast path: use the pre-warmed standby coordinator.
+            if (_standbyCoordinator != null && _standbyCoordinator.IsEncoderReady)
+            {
+                _coordinator        = _standbyCoordinator;
+                _standbyCoordinator = null;
+                IsStandby           = false;
+                ActiveSessionId     = _coordinator.SessionId;
+
+                _coordinator.Begin();
+                IsRecording = true;
+                Debug.Log($"[SF-Recorder] Recording started (pre-warmed). Session='{ActiveSessionId}'");
+                RecordingStartedEvent?.Invoke(_coordinator.TempDir);
+                return;
+            }
+
+            // Fallback: cold start (some frame drops expected while encoders warm up).
+            _standbyCoordinator?.Dispose();
+            _standbyCoordinator = null;
+            IsStandby           = false;
+
             ActiveSessionId = string.IsNullOrEmpty(m_SessionId)
                 ? Guid.NewGuid().ToString("N")
                 : m_SessionId;
@@ -175,7 +239,7 @@ namespace SensorFlex.Recorder
             string tempDir = Path.Combine(
                 Application.temporaryCachePath, "SF-Recorder", ActiveSessionId);
 
-            _coordinator = new CaptureCoordinator(this, tempDir);
+            _coordinator = new CaptureCoordinator(this, tempDir, ActiveSessionId);
 
             if (!_coordinator.StartCapture())
             {
@@ -187,7 +251,7 @@ namespace SensorFlex.Recorder
             }
 
             IsRecording = true;
-            Debug.Log($"[SF-Recorder] Recording started. Session='{ActiveSessionId}' TempDir='{tempDir}'");
+            Debug.Log($"[SF-Recorder] Recording started (cold). Session='{ActiveSessionId}'");
             RecordingStartedEvent?.Invoke(tempDir);
         }
 
@@ -198,9 +262,27 @@ namespace SensorFlex.Recorder
 
             IsRecording = false;
             BeginFinalization();
+            PrepareRecording();
         }
 
         // ── Private helpers ────────────────────────────────────────────────
+
+        // Prepares the next recording session in the background. Called from Start()
+        // and after each StopRecording(). Creates a standby coordinator that dims-scans
+        // immediately; StartEngines() is driven from Update() once finalization is done.
+        void PrepareRecording()
+        {
+            if (_standbyCoordinator != null) return;  // already preparing
+
+            string sessionId = string.IsNullOrEmpty(m_SessionId)
+                ? Guid.NewGuid().ToString("N")
+                : m_SessionId;
+            string tempDir = Path.Combine(
+                Application.temporaryCachePath, "SF-Recorder", sessionId);
+
+            _standbyCoordinator = new CaptureCoordinator(this, tempDir, sessionId);
+            IsStandby = false;
+        }
 
         void BeginFinalization()
         {
