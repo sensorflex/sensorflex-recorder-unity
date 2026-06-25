@@ -18,8 +18,9 @@ namespace SensorFlex.Recorder.Editor
 
             // Compression.framework provides compression_encode_buffer (COMPRESSION_LZ4_RAW)
             // used by SFDepthLz4_AppendFrame in SFVideoEncoder.mm.
-            string mainTarget = project.GetUnityMainTargetGuid();
-            project.AddFrameworkToProject(mainTarget, "Compression.framework", false);
+            // Plugin .mm files are compiled into UnityFramework (not Unity-iPhone) in Unity 6.
+            string frameworkTarget = project.GetUnityFrameworkTargetGuid();
+            project.AddFrameworkToProject(frameworkTarget, "Compression.framework", false);
 
             project.WriteToFile(pbxPath);
         }
